@@ -259,7 +259,7 @@ prompt_config() {
     info "봇 설정값 입력 (모든 항목의 공백은 자동 제거됩니다)"
     echo
 
-    local mast_url mast_token max_len admin coc_id
+    local mast_url mast_token max_len admin coc_id rt_id custom_id
     local markdown_input markdown_enabled
     local decoration_input decoration_char decoration_pos decoration_both
 
@@ -295,16 +295,31 @@ prompt_config() {
     admin="$(sanitize_id "$(read_line '   > ')")"
     echo
 
-    echo "${BOLD}5) 메인 Google Sheets ID${RESET}"
-    echo "   - 도움말/커스텀/장비/레이드/상점/전투용 페이지가 모두 포함된 단일 시트."
+    echo "${BOLD}5) CoC 캐릭터 시트 ID${RESET}"
     coc_id="$(sanitize_no_space "$(read_line '   > ')")"
     if [[ -z "$coc_id" ]]; then
-        err "메인 시트 ID 는 필수입니다."
+        err "CoC 시트 ID 는 필수입니다."
         exit 1
     fi
     echo
 
-    echo "${BOLD}6) 서버가 Markdown 형식(${RESET}*기울임꼴*${BOLD}/${RESET}**볼드체**${BOLD} 등)을 지원하나요?${RESET}"
+    echo "${BOLD}6) 랜덤표 시트 ID${RESET}"
+    rt_id="$(sanitize_no_space "$(read_line '   > ')")"
+    if [[ -z "$rt_id" ]]; then
+        err "랜덤표 시트 ID 는 필수입니다."
+        exit 1
+    fi
+    echo
+
+    echo "${BOLD}7) 커스텀 시트 ID${RESET}"
+    custom_id="$(sanitize_no_space "$(read_line '   > ')")"
+    if [[ -z "$custom_id" ]]; then
+        err "커스텀 시트 ID 는 필수입니다."
+        exit 1
+    fi
+    echo
+
+    echo "${BOLD}8) 서버가 Markdown 형식(${RESET}*기울임꼴*${BOLD}/${RESET}**볼드체**${BOLD} 등)을 지원하나요?${RESET}"
     echo "   - 한참 인스턴스는 지원하므로 y를 입력해주세요."
     echo "   - 그 외의 서버는 n을 입력해주세요."
     markdown_input="$(sanitize_no_space "$(read_line '   > (y/n) ')")"
@@ -323,7 +338,7 @@ prompt_config() {
     echo "   ↳ ${CYAN}MARKDOWN_ENABLED=${markdown_enabled}${RESET}"
     echo
 
-    echo "${BOLD}7) 자동봇 결과 출력 시 붙는 특수문자는 무엇으로 지정할까요?${RESET}"
+    echo "${BOLD}9) 자동봇 결과 출력 시 붙는 특수문자는 무엇으로 지정할까요?${RESET}"
     echo "   - ✦ 관찰력 ✦ 이렇게 출력됩니다."
     echo "   - 기본 ✦ 을 사용하고 싶으시면 엔터를 눌러주세요."
     echo "   - 다른 특수문자를 사용하고 싶으시면 인터넷에서 원하시는 특수문자를"
@@ -350,7 +365,7 @@ prompt_config() {
     echo
 
     if [[ -n "$decoration_char" ]]; then
-        echo "${BOLD}8) 자동봇 결과 출력 시 특수문자가 판정 기능치의 앞에만 붙을까요, 양 옆에 붙을까요?${RESET}"
+        echo "${BOLD}10) 자동봇 결과 출력 시 특수문자가 판정 기능치의 앞에만 붙을까요, 양 옆에 붙을까요?${RESET}"
         echo "   - ${decoration_char} 관찰력 ${decoration_char} 을 원하시면 ${BOLD}2${RESET} 를 입력하고 엔터"
         echo "   - ${decoration_char} 관찰력 을 원하시면 ${BOLD}1${RESET} 을 입력하고 엔터"
         decoration_pos="$(sanitize_no_space "$(read_line '   > (1/2) ')")"
@@ -374,13 +389,16 @@ prompt_config() {
     fi
 
     cat > "$INSTALL_DIR/.env" <<EOF
-# 자동봇 설정 (install.sh 로 자동 생성)
+# CoC 봇 설정 (install.sh 로 자동 생성)
 
 MASTODON_API_BASE_URL=https://${mast_url}
 MASTODON_ACCESS_TOKEN=${mast_token}
 SHEET_ID=${coc_id}
 SYSTEM_ADMIN_ID=${admin}
 MAX_MESSAGE_LENGTH=${max_len}
+
+RANDOM_TABLE_SHEET_ID=${rt_id}
+CUSTOM_COMMAND_SHEET_ID=${custom_id}
 
 MARKDOWN_ENABLED=${markdown_enabled}
 DECORATION_CHAR=${decoration_char}
