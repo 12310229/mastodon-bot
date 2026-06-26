@@ -232,29 +232,16 @@ def warmup_cache(sheets_manager, sheet_name: Optional[str] = None) -> None:
 
 
 def warmup_aux_caches(sheets_manager) -> None:
-    """부팅 시 보조 시트(랜덤표/커스텀) 인덱스/캐시를 프리로드.
+    """부팅 시 '커스텀' 워크시트(메인 시트 내부) 캐시를 프리로드.
 
-    이걸 안 하면 첫 사용자의 보조 시트 명령어에서 스프레드시트 연결 비용
-    (3~5초/시트) 이 통째로 발생한다. 각 봇이 부팅 시 한 번 호출.
-
-    설정되지 않은 시트(env 미설정) 는 자동 스킵.
+    워크시트가 없으면 자동 스킵.
     """
     if sheets_manager is None:
         return
 
-    # 랜덤표
-    try:
-        rt_count = sheets_manager.warmup_random_table()
-        if rt_count >= 0:
-            logger.info(f"  ✓ 랜덤표 캐시 ({rt_count}개 표)")
-    except Exception as e:
-        logger.warning("랜덤표 캐시 준비 실패 — 첫 사용 시 지연 가능")
-        logger.debug(f"  사유: {e}")
-
-    # 커스텀
     try:
         cmd_count = sheets_manager.warmup_custom_command()
-        if cmd_count >= 0:
+        if cmd_count > 0:
             logger.info(f"  ✓ 커스텀 명령어 캐시 ({cmd_count}개)")
     except Exception as e:
         logger.warning("커스텀 명령어 캐시 준비 실패 — 첫 사용 시 지연 가능")

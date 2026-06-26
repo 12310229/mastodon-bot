@@ -88,10 +88,8 @@ class Config:
     SHEET_ID: str = os.getenv('SHEET_ID', '')
 
     # ------------------------------------------------------------------
-    # 공유 보조 시트 (모든 봇이 참조)
+    # 커스텀 명령어 워크시트 (메인 SHEET_ID 내부 페이지 이름)
     # ------------------------------------------------------------------
-    RANDOM_TABLE_SHEET_ID: str = os.getenv('RANDOM_TABLE_SHEET_ID', '').strip()
-    CUSTOM_COMMAND_SHEET_ID: str = os.getenv('CUSTOM_COMMAND_SHEET_ID', '').strip()
     CUSTOM_COMMAND_WORKSHEET: str = os.getenv('CUSTOM_COMMAND_WORKSHEET', '커스텀').strip() or '커스텀'
 
     # ------------------------------------------------------------------

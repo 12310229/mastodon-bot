@@ -43,7 +43,7 @@ GLOBAL_FIELD_SPECS: Dict[str, FieldSpec] = {
     ),
     'SHEET_ID': FieldSpec(
         key='SHEET_ID',
-        prompt='CoC 캐릭터 시트의 Google Sheets ID',
+        prompt='메인 Google Sheets ID (도움말/커스텀/장비/레이드/상점 포함)',
         default='',
     ),
     'SYSTEM_ADMIN_ID': FieldSpec(
@@ -55,16 +55,6 @@ GLOBAL_FIELD_SPECS: Dict[str, FieldSpec] = {
         key='GOOGLE_CREDENTIALS_PATH',
         prompt='Google 인증 파일 경로',
         default='credentials.json',
-    ),
-    'RANDOM_TABLE_SHEET_ID': FieldSpec(
-        key='RANDOM_TABLE_SHEET_ID',
-        prompt='랜덤표 스프레드시트 ID (선택, 비우면 비활성화)',
-        default='',
-    ),
-    'CUSTOM_COMMAND_SHEET_ID': FieldSpec(
-        key='CUSTOM_COMMAND_SHEET_ID',
-        prompt='커스텀 명령어 스프레드시트 ID (선택, 비우면 비활성화)',
-        default='',
     ),
     'OPERATION_START_DATE': FieldSpec(
         key='OPERATION_START_DATE',
@@ -98,7 +88,7 @@ GLOBAL_FIELD_SPECS: Dict[str, FieldSpec] = {
 GLOBAL_SECTIONS: Tuple[SectionSpec, ...] = (
     SectionSpec(
         title='필수 항목',
-        description='Mastodon 연결 + CoC 시트 설정',
+        description='Mastodon 연결 + 메인 시트',
         keys=(
             'MASTODON_API_BASE_URL',
             'MASTODON_ACCESS_TOKEN',
@@ -106,11 +96,6 @@ GLOBAL_SECTIONS: Tuple[SectionSpec, ...] = (
             'SYSTEM_ADMIN_ID',
             'GOOGLE_CREDENTIALS_PATH',
         ),
-    ),
-    SectionSpec(
-        title='보조 시트 (선택)',
-        description='랜덤표/커스텀 명령어 시트. 비우면 해당 기능 비활성화.',
-        keys=('RANDOM_TABLE_SHEET_ID', 'CUSTOM_COMMAND_SHEET_ID'),
     ),
     SectionSpec(
         title='가동 기간 (선택)',

@@ -79,14 +79,7 @@ class SheetsManager:
         # OrderedDict 으로 LRU 동작 (최근 접근을 마지막으로 이동)
         self._worksheets_cache: "OrderedDict[str, gspread.Worksheet]" = OrderedDict()
 
-        # 보조 스프레드시트 (랜덤표 / 커스텀 명령어). 모든 봇이 공유하며 lazy 로딩.
-        self._random_table_spreadsheet: Optional[gspread.Spreadsheet] = None
-        self._custom_command_spreadsheet: Optional[gspread.Spreadsheet] = None
-
-        # 보조 시트 캐시 (TTL 기반)
-        self._random_table_index_cache: Optional[Dict[str, str]] = None
-        self._random_table_index_expires: float = 0.0
-        self._random_table_values_cache: Dict[str, Tuple[float, List[str]]] = {}
+        # '커스텀' 워크시트 캐시 (메인 시트 내부 페이지, TTL 기반)
         self._custom_command_cache: Optional[Dict[str, List[str]]] = None
         self._custom_command_cache_expires: float = 0.0
         self._aux_lock = threading.RLock()
@@ -632,49 +625,10 @@ class SheetsManager:
             logger.error(f"학생 행 찾기 실패: {e}")
             return None
     
-    # ==================== 보조 시트 (랜덤표 / 커스텀) ====================
-
-    def _open_aux_spreadsheet(self, sheet_id: str) -> Optional[gspread.Spreadsheet]:
-        """보조 스프레드시트 1회 연결. 인증 파일은 본 시트와 공유."""
-        if not sheet_id:
-            return None
-        try:
-            gc = gspread.service_account(filename=str(self.credentials_path))
-            spreadsheet = gc.open_by_key(sheet_id)
-            logger.debug(f"보조 스프레드시트 연결: {sheet_id}")
-            return spreadsheet
-        except FileNotFoundError:
-            logger.error(f"보조 스프레드시트 인증 파일 없음: {self.credentials_path}")
-        except gspread.exceptions.SpreadsheetNotFound:
-            logger.error(f"보조 스프레드시트를 찾을 수 없음 (ID={sheet_id})")
-        except Exception as e:
-            logger.error(f"보조 스프레드시트 연결 실패 (ID={sheet_id}): {e}")
-        return None
-
-    def _get_random_table_spreadsheet(self) -> Optional[gspread.Spreadsheet]:
-        """랜덤표 스프레드시트 핸들 (lazy)."""
-        if not getattr(config, 'RANDOM_TABLE_SHEET_ID', ''):
-            return None
-        with self._aux_lock:
-            if self._random_table_spreadsheet is None:
-                self._random_table_spreadsheet = self._open_aux_spreadsheet(
-                    config.RANDOM_TABLE_SHEET_ID
-                )
-            return self._random_table_spreadsheet
-
-    def _get_custom_command_spreadsheet(self) -> Optional[gspread.Spreadsheet]:
-        """커스텀 명령어 스프레드시트 핸들 (lazy)."""
-        if not getattr(config, 'CUSTOM_COMMAND_SHEET_ID', ''):
-            return None
-        with self._aux_lock:
-            if self._custom_command_spreadsheet is None:
-                self._custom_command_spreadsheet = self._open_aux_spreadsheet(
-                    config.CUSTOM_COMMAND_SHEET_ID
-                )
-            return self._custom_command_spreadsheet
+    # ==================== '커스텀' 워크시트 (메인 시트 내부) ====================
 
     def _aux_cache_ttl(self) -> int:
-        """보조 시트 캐시 TTL (config.CACHE_TTL 사용, 최소 30초)."""
+        """커스텀 워크시트 캐시 TTL (config.CACHE_TTL 사용, 최소 30초)."""
         ttl = getattr(config, 'CACHE_TTL', 1800)
         try:
             ttl = int(ttl)
@@ -682,120 +636,17 @@ class SheetsManager:
             ttl = 1800
         return max(ttl, 30)
 
-    def _refresh_random_table_index(self) -> Dict[str, str]:
-        """랜덤표의 워크시트 이름 인덱스를 (재)구축. {정규화된 이름: 실제 이름}."""
-        spreadsheet = self._get_random_table_spreadsheet()
-        if spreadsheet is None:
-            return {}
-
-        index: Dict[str, str] = {}
-        try:
-            worksheets = spreadsheet.worksheets()
-        except Exception as e:
-            logger.warning(f"랜덤표 워크시트 목록 조회 실패: {e}")
-            return {}
-
-        for ws in worksheets:
-            title = (ws.title or '').strip()
-            if not title:
-                continue
-            normalized = _normalize_keyword(title)
-            if not normalized:
-                continue
-            # 동일 정규화에 여러 시트가 매핑되면 먼저 발견된 것을 유지.
-            index.setdefault(normalized, title)
-        return index
-
-    def _get_random_table_index(self) -> Dict[str, str]:
-        """랜덤표 워크시트 인덱스 (TTL 캐시)."""
-        with self._aux_lock:
-            now = time.time()
-            if self._random_table_index_cache is not None and now < self._random_table_index_expires:
-                return self._random_table_index_cache
-            index = self._refresh_random_table_index()
-            self._random_table_index_cache = index
-            self._random_table_index_expires = now + self._aux_cache_ttl()
-            return index
-
-    def _read_random_table_values(self, worksheet_title: str) -> List[str]:
-        """랜덤표의 한 워크시트에서 2행~끝 컬럼 A의 비어 있지 않은 값들을 반환."""
-        spreadsheet = self._get_random_table_spreadsheet()
-        if spreadsheet is None:
-            return []
-
-        try:
-            worksheet = spreadsheet.worksheet(worksheet_title)
-        except gspread.exceptions.WorksheetNotFound:
-            logger.debug(f"랜덤표 워크시트 사라짐: {worksheet_title}")
-            return []
-        except Exception as e:
-            logger.warning(f"랜덤표 워크시트 접근 실패 ({worksheet_title}): {e}")
-            return []
-
-        try:
-            column_values = worksheet.col_values(1)
-        except Exception as e:
-            logger.warning(f"랜덤표 컬럼 읽기 실패 ({worksheet_title}): {e}")
-            return []
-
-        # 1행은 헤더로 간주하고 스킵, 2행부터 비어 있지 않은 값만.
-        values = [v.strip() for v in column_values[1:] if v and v.strip()]
-        return values
-
-    def pick_random_table_value(self, table_name: str) -> Optional[str]:
-        """
-        랜덤표 시트에서 `table_name` 과 매칭되는 워크시트의 무작위 값을 반환.
-
-        매칭 규칙: 대소문자 무시, 모든 공백 제거.
-        매칭되는 워크시트가 없거나 값이 없으면 None.
-        """
-        if not table_name or not getattr(config, 'RANDOM_TABLE_SHEET_ID', ''):
-            return None
-
-        normalized = _normalize_keyword(table_name)
-        if not normalized:
-            return None
-
-        index = self._get_random_table_index()
-        actual_title = index.get(normalized)
-        if actual_title is None:
-            # 캐시가 오래된 경우 한 번 더 강제 새로고침 시도.
-            with self._aux_lock:
-                self._random_table_index_cache = None
-                self._random_table_index_expires = 0.0
-            index = self._get_random_table_index()
-            actual_title = index.get(normalized)
-            if actual_title is None:
-                return None
-
-        ttl = self._aux_cache_ttl()
-        now = time.time()
-        with self._aux_lock:
-            cached = self._random_table_values_cache.get(actual_title)
-            if cached and now < cached[0]:
-                values = cached[1]
-            else:
-                values = self._read_random_table_values(actual_title)
-                self._random_table_values_cache[actual_title] = (now + ttl, values)
-
-        if not values:
-            logger.debug(f"랜덤표 '{actual_title}'에 사용 가능한 값이 없음")
-            return None
-
-        return random.choice(values)
-
     def _refresh_custom_command_cache(self) -> Dict[str, List[str]]:
-        """'커스텀' 워크시트 전체를 읽어 {정규화된 명령어: [문구, ...]} 로 반환."""
-        spreadsheet = self._get_custom_command_spreadsheet()
-        if spreadsheet is None:
-            return {}
+        """메인 시트의 '커스텀' 워크시트를 읽어 {정규화된 명령어: [문구, ...]} 반환.
 
+        시트 레이아웃: 1행 헤더('명령어'/'문구' 컬럼), 2행 설명, 3행~ 데이터.
+        """
         worksheet_name = getattr(config, 'CUSTOM_COMMAND_WORKSHEET', '커스텀') or '커스텀'
 
         try:
-            worksheet = spreadsheet.worksheet(worksheet_name)
+            worksheet = self.spreadsheet.worksheet(worksheet_name)
         except gspread.exceptions.WorksheetNotFound:
-            logger.warning(f"커스텀 명령어 워크시트를 찾을 수 없음: {worksheet_name}")
+            logger.debug(f"커스텀 명령어 워크시트 없음: {worksheet_name} (스킵)")
             return {}
         except Exception as e:
             logger.warning(f"커스텀 명령어 워크시트 접근 실패: {e}")
@@ -849,12 +700,12 @@ class SheetsManager:
 
     def pick_custom_command_value(self, command_name: str) -> Optional[str]:
         """
-        커스텀 명령어 시트에서 `command_name` 과 매칭되는 문구를 무작위로 반환.
+        '커스텀' 워크시트에서 `command_name` 과 매칭되는 문구를 무작위로 반환.
 
         매칭 규칙: 대소문자 무시, 모든 공백 제거.
         매칭이 없으면 None.
         """
-        if not command_name or not getattr(config, 'CUSTOM_COMMAND_SHEET_ID', ''):
+        if not command_name:
             return None
 
         normalized = _normalize_keyword(command_name)
@@ -911,13 +762,6 @@ class SheetsManager:
             if (getattr(ws, 'title', '') or '').strip() != help_name
         )
 
-    def invalidate_random_table_cache(self) -> None:
-        """랜덤표 캐시(인덱스 + 워크시트별 값)만 무효화."""
-        with self._aux_lock:
-            self._random_table_index_cache = None
-            self._random_table_index_expires = 0.0
-            self._random_table_values_cache.clear()
-
     def invalidate_custom_command_cache(self) -> None:
         """커스텀 명령어 캐시만 무효화."""
         with self._aux_lock:
@@ -925,29 +769,15 @@ class SheetsManager:
             self._custom_command_cache_expires = 0.0
 
     def invalidate_aux_caches(self) -> None:
-        """랜덤표/커스텀 명령어 캐시를 모두 무효화."""
-        self.invalidate_random_table_cache()
+        """커스텀 명령어 캐시 무효화 (이전 랜덤표 API 호환)."""
         self.invalidate_custom_command_cache()
-
-    def warmup_random_table(self) -> int:
-        """랜덤표 워크시트 인덱스를 미리 채운다.
-
-        Returns:
-            캐시된 워크시트 개수. `RANDOM_TABLE_SHEET_ID` 미설정 시 -1.
-        """
-        if not getattr(config, 'RANDOM_TABLE_SHEET_ID', ''):
-            return -1
-        index = self._get_random_table_index()
-        return len(index)
 
     def warmup_custom_command(self) -> int:
         """커스텀 명령어 캐시를 미리 채운다.
 
         Returns:
-            캐시된 명령어 개수. `CUSTOM_COMMAND_SHEET_ID` 미설정 시 -1.
+            캐시된 명령어 개수. 워크시트가 없으면 0.
         """
-        if not getattr(config, 'CUSTOM_COMMAND_SHEET_ID', ''):
-            return -1
         cache = self._get_custom_command_cache()
         return len(cache)
 

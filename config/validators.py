@@ -101,13 +101,9 @@ class ConfigValidator:
         if Config.LOG_LEVEL.upper() not in valid_log_levels:
             result.add_error(f"LOG_LEVEL은 다음 중 하나여야 합니다: {', '.join(valid_log_levels)}")
 
-        # 시트 ID 3종 모두 필수 (CoC 캐릭터 / 랜덤표 / 커스텀)
+        # 시트 ID — 메인 시트 하나만 사용 (커스텀/도움말/장비/레이드/상점/전투용 모두 포함)
         if not Config.SHEET_ID or not Config.SHEET_ID.strip():
-            result.add_error("SHEET_ID 가 설정되지 않았습니다 (CoC 캐릭터 시트).")
-        if not Config.RANDOM_TABLE_SHEET_ID or not Config.RANDOM_TABLE_SHEET_ID.strip():
-            result.add_error("RANDOM_TABLE_SHEET_ID 가 설정되지 않았습니다 (랜덤표 시트).")
-        if not Config.CUSTOM_COMMAND_SHEET_ID or not Config.CUSTOM_COMMAND_SHEET_ID.strip():
-            result.add_error("CUSTOM_COMMAND_SHEET_ID 가 설정되지 않았습니다 (커스텀 명령어 시트).")
+            result.add_error("SHEET_ID 가 설정되지 않았습니다.")
 
         # 관리자 ID
         if not Config.SYSTEM_ADMIN_ID or not Config.SYSTEM_ADMIN_ID.strip():

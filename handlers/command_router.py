@@ -224,15 +224,7 @@ class ModernCommandRouter:
                 if executed is not None:
                     return executed
 
-            # 5. 2순위: 랜덤표 시트
-            random_table_value = self._lookup_random_table(first_keyword)
-            if random_table_value is not None:
-                return self._build_aux_sheet_result(
-                    user_id, keywords, full_command, first_keyword_lower,
-                    random_table_value, start_time, source='random_table',
-                )
-
-            # 6. 3순위: 커스텀 명령어 시트
+            # 5. 2순위: 커스텀 명령어 시트 (메인 시트의 '커스텀' 워크시트)
             custom_value = self._lookup_custom_command(first_keyword)
             if custom_value is not None:
                 return self._build_aux_sheet_result(
@@ -240,7 +232,7 @@ class ModernCommandRouter:
                     custom_value, start_time, source='custom',
                 )
 
-            # 7. 4순위: CoC 룰 명령어 (default/system 외에 등록된 것)
+            # 6. 3순위: 신규 룰 명령어 (default/system 외에 등록된 것: 상태창/판정/주식 등)
             if registered:
                 executed = self._execute_registered(
                     registered, user_id, keywords, context,
@@ -249,33 +241,7 @@ class ModernCommandRouter:
                 if executed is not None:
                     return executed
 
-            # 8. 5순위: CoC 폴백 핸들러
-            #    위에서 모두 매칭 실패하면 CoC 룰 폴백 (`__coc_fallback__`,
-            #    시트 기반 능력치/기능/무기/스탯변동) 으로 넘긴다.
-            #    폴백이 자체 에러 메시지를 가질 수 있으므로 (예: "'근력'은 시트에서
-            #    찾을 수 없습니다") 성공/실패 모두 그 결과를 그대로 반환한다.
-            fallback_instance = self.factory.create_command_by_keyword('__coc_fallback__')
-            if fallback_instance is not None:
-                if should_log_debug():
-                    logger.debug(f"[라우팅] CoC 폴백 사용 (키워드={first_keyword})")
-
-                execution_context = self._create_execution_context(user_id, keywords, context)
-                response = self._execute_command(fallback_instance, execution_context)
-
-                execution_time = time.time() - start_time
-                command_result = self._convert_to_command_result(
-                    response, first_keyword_lower, user_id, keywords, execution_time,
-                )
-                log_command_result(
-                    user_id=user_id,
-                    command=full_command,
-                    success=command_result.is_successful(),
-                    duration=execution_time,
-                    result_length=len(command_result.get_user_message()) if command_result.get_user_message() else 0,
-                )
-                return command_result
-
-            # 9. 모두 매칭 실패 → "없는 명령어" 안내
+            # 7. 모두 매칭 실패 → "없는 명령어" 안내
             execution_time = time.time() - start_time
             log_command_result(
                 user_id=user_id,
@@ -344,23 +310,9 @@ class ModernCommandRouter:
         )
         return command_result
 
-    def _lookup_random_table(self, keyword: str) -> Optional[str]:
-        """랜덤표 시트에서 매칭되는 워크시트의 무작위 값을 반환. 없으면 None."""
-        if not self.sheets_manager:
-            return None
-        if not getattr(config, 'RANDOM_TABLE_SHEET_ID', ''):
-            return None
-        try:
-            return self.sheets_manager.pick_random_table_value(keyword)
-        except Exception as e:
-            logger.warning(f"[랜덤표] 조회 실패 (키워드={keyword}): {e}")
-            return None
-
     def _lookup_custom_command(self, keyword: str) -> Optional[str]:
-        """커스텀 명령어 시트에서 매칭되는 문구를 반환. 없으면 None."""
+        """메인 시트의 '커스텀' 워크시트에서 매칭되는 문구를 반환. 없으면 None."""
         if not self.sheets_manager:
-            return None
-        if not getattr(config, 'CUSTOM_COMMAND_SHEET_ID', ''):
             return None
         try:
             return self.sheets_manager.pick_custom_command_value(keyword)
