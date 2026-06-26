@@ -29,11 +29,6 @@ try:
     from handlers.command_router import initialize_command_router
     from utils.api_retry import api_retry
     from utils.stock_engine import get_stock_engine
-    from utils.shared_sheet import (
-        EQUIP_DATA_START_ROW,
-        EQUIP_STOCK_COLS,
-        WS_EQUIP_STOCK,
-    )
 except ImportError as e:
     print(f"필수 모듈 임포트 실패: {e}")
     print("필요한 패키지가 설치되어 있는지 확인해주세요.")
@@ -454,67 +449,17 @@ class BotApplication:
             logger.debug(LogFormatter.operation_fail("[종료] 정리 작업", e), exc_info=True)
 
     # ------------------------------------------------------------------
-    # 주식 가격 변동 후 모든 캐릭터의 평가 상승률(H/K/N)을 일괄 갱신.
+    # 주식 가격 변동 콜백 — 시트 동기화 대상 없음.
+    # 시트에는 주 수/투자금만 저장하고, 수익금·이익률은 [상태창]/거래 응답에서
+    # 즉시 계산하므로 6h마다 일괄 갱신할 셀이 없다. 로그만 남긴다.
     # ------------------------------------------------------------------
-    def _refresh_character_stock_rates(self, _results) -> None:
-        """주식 엔진 콜백 — 6시간 사이클마다 '장비 및 주식' 캐릭터별 H/K/N
-        상승률 셀을 일괄 갱신. 가격 자체는 JSON 에만 보관.
-
-        실패해도 다음 사이클에 재계산되므로 예외는 삼킴.
-        """
-        if not self.sheets_manager or not self.stock_engine:
+    def _refresh_character_stock_rates(self, results) -> None:
+        if not results:
             return
+        summary = ', '.join(f"{name} {before}→{after}" for name, before, after in results)
+        logger.info(f"[stock] 6h 사이클 적용: {summary}")
 
-        try:
-            ws = self.sheets_manager.get_worksheet(WS_EQUIP_STOCK)
-            all_values = ws.get_all_values()
-        except Exception as e:
-            logger.warning(f"[stock] '{WS_EQUIP_STOCK}' 읽기 실패 (갱신 스킵): {e}")
-            return
 
-        current_prices = {
-            name: price for name, price, _change in self.stock_engine.get_all_snapshots()
-        }
-
-        updates = []
-        for idx, row_values in enumerate(all_values, start=1):
-            if idx < EQUIP_DATA_START_ROW:
-                continue
-            if not row_values:
-                continue
-            title = (row_values[0] or '').strip() if len(row_values) >= 1 else ''
-            if not title:
-                continue
-            for stock_name, (shares_col, invest_col, rate_col) in EQUIP_STOCK_COLS.items():
-                price = current_prices.get(stock_name)
-                if price is None:
-                    continue
-                shares_raw = row_values[shares_col - 1] if len(row_values) >= shares_col else ''
-                invest_raw = row_values[invest_col - 1] if len(row_values) >= invest_col else ''
-                try:
-                    shares = int(str(shares_raw or '0').strip() or '0')
-                except (TypeError, ValueError):
-                    shares = 0
-                try:
-                    invested = int(str(invest_raw or '0').strip() or '0')
-                except (TypeError, ValueError):
-                    invested = 0
-                if invested <= 0 or shares <= 0:
-                    rate_str = '+0.0%'
-                else:
-                    rate = (shares * price - invested) / invested * 100.0
-                    sign = '+' if rate >= 0 else ''
-                    rate_str = f"{sign}{rate:.1f}%"
-                updates.append((idx, rate_col, rate_str))
-
-        if not updates:
-            return
-        ok = self.sheets_manager.batch_update_cells(WS_EQUIP_STOCK, updates)
-        if ok:
-            logger.info(f"[stock] 캐릭터 상승률 갱신 ✓ ({len(updates)}셀)")
-        else:
-            logger.warning("[stock] 캐릭터 상승률 batch_update 실패")
-    
     def get_status(self) -> dict:
         """애플리케이션 상태 반환 (개발/디버깅용)"""
         status = {

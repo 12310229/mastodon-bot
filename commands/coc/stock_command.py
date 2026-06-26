@@ -3,16 +3,12 @@
 
 - 종목: 재원 / 차성 / 적연
 - 가격 / 매수·매도 누적 / 6시간 주기 갱신은 utils.stock_engine 이 담당.
-- 본 명령어는 캐릭터의 골드·주 수·투자금·상승률을 '장비 및 주식' 시트에서
-  갱신한다.
-
-상승률(H/K/N) 정의:
-    (현재 평가액 - 누적 투자금) / 누적 투자금 × 100   (투자금 0이면 0)
+- 본 명령어는 캐릭터의 골드·주 수·투자금을 '장비 및 주식' 시트에서 갱신한다.
+- 시트의 주식 컬럼 구조: F/G = 재원, H/I = 차성, J/K = 적연 (각각 주 수 / 투자금).
+- 상승률 컬럼은 시트에 없음. 수익금/이익률은 [상태창]에서 즉시 계산해 표시.
 """
 
 from __future__ import annotations
-
-from typing import Tuple
 
 from commands.base_command import BaseCommand, CommandContext, CommandResponse
 from commands.registry import register_command
@@ -29,14 +25,6 @@ from utils.shared_sheet import (
     read_int_cell,
 )
 from utils.stock_engine import get_stock_engine
-
-
-def _recompute_rate(shares: int, invested: int, price: int) -> float:
-    """투자금 대비 평가액 상승률(%). 투자금이 0이면 0."""
-    if invested <= 0 or shares <= 0:
-        return 0.0
-    value = shares * price
-    return (value - invested) / invested * 100.0
 
 
 def _format_rate(rate: float) -> str:
@@ -73,7 +61,6 @@ class StockCommand(BaseCommand):
         if head == '주식매도':
             return self._handle_trade(context, side='sell')
 
-        # `[주식]` 단독 입력 → 안내
         raise CommandError(
             "사용법: [주식 확인] / [주식 구매/종목/수량] / [주식 매도/종목/수량]"
         )
@@ -132,7 +119,7 @@ class StockCommand(BaseCommand):
                 f"'장비 및 주식' 시트에서 '{title}' 캐릭터를 찾을 수 없습니다."
             )
 
-        shares_col, invest_col, rate_col = EQUIP_STOCK_COLS[stock_name]
+        shares_col, invest_col = EQUIP_STOCK_COLS[stock_name]
 
         with acquire_user_lock(context.user_id, timeout=10.0):
             current_gold = read_int_cell(
@@ -172,17 +159,25 @@ class StockCommand(BaseCommand):
                     new_invest = 0
                 action_label = '매도'
 
-            new_rate = _recompute_rate(new_shares, new_invest, price)
-
             updates = [
                 (equip_row, EQUIP_COL_GOLD, str(new_gold)),
                 (equip_row, shares_col, str(new_shares)),
                 (equip_row, invest_col, str(new_invest)),
-                (equip_row, rate_col, _format_rate(new_rate)),
             ]
             ok = self.sheets_manager.batch_update_cells(WS_EQUIP_STOCK, updates)
             if not ok:
                 raise CommandError("시트 업데이트에 실패했습니다.")
+
+        # 표시용 즉시 계산.
+        # 수익금 = 현재가 × 주 수 − 투자금
+        # 이익률 = 현재가 × 주 수 / 투자금 × 100  (투자금 0이면 0%)
+        value = price * new_shares
+        profit = value - new_invest
+        if new_invest > 0:
+            ratio = value / new_invest * 100.0
+        else:
+            ratio = 0.0
+        profit_sign = '+' if profit >= 0 else ''
 
         delta_sign = '-' if side == 'buy' else '+'
         message = (
@@ -191,7 +186,7 @@ class StockCommand(BaseCommand):
             f"보유 골드: {current_gold} → {new_gold} ({delta_sign}{total})\n"
             f"보유 주: {cur_shares} → {new_shares}주\n"
             f"누적 투자금: {cur_invest} → {new_invest} 골드\n"
-            f"평가 상승률: {_format_rate(new_rate)}"
+            f"평가 손익: {profit_sign}{profit}G ({ratio:.2f}%)"
         )
         logger.info(
             f"[주식 {action_label}] @{context.user_id} ({title}) {stock_name} "
@@ -204,6 +199,6 @@ class StockCommand(BaseCommand):
                 'price': price, 'total': total,
                 'gold_before': current_gold, 'gold_after': new_gold,
                 'shares_after': new_shares, 'invest_after': new_invest,
-                'rate_after': new_rate,
+                'profit': profit, 'ratio': ratio,
             },
         )

@@ -22,12 +22,19 @@ except ImportError as e:
     raise
 
 
+_MAX_OPTIONS = 40
+
+
 @register_command(
     name="랜덤",
     aliases=["random", "무작위", "선택"],
-    description="주어진 옵션 중 하나를 랜덤으로 선택합니다.",
+    description=f"주어진 옵션 중 하나를 랜덤으로 선택합니다. (최대 {_MAX_OPTIONS}개)",
     category="게임",
-    examples=["[랜덤/사과, 바나나, 포도]", "[랜덤/예, 아니오]"],
+    examples=[
+        "[랜덤/사과, 바나나, 포도]",
+        "[선택/사과, 바나나, 포도]",
+        "[랜덤/예, 아니오]",
+    ],
     requires_sheets=False,
     requires_api=False
 )
@@ -122,6 +129,12 @@ class RandomCommand(BaseCommand):
 
         # 컴마로 분리하고 공백 제거
         options = [opt.strip() for opt in combined.split(',') if opt.strip()]
+
+        if len(options) > _MAX_OPTIONS:
+            raise CommandError(
+                f"옵션은 최대 {_MAX_OPTIONS}개까지 입력할 수 있습니다. "
+                f"(입력: {len(options)}개)"
+            )
 
         logger.debug(f"파싱된 옵션: {options}")
         return options

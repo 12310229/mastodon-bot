@@ -42,11 +42,12 @@ EQUIP_COL_GOLD = 2      # B
 EQUIP_COL_ARMOR = 3     # C
 EQUIP_COL_WEAPON = 4    # D
 EQUIP_COL_ACCESSORY = 5 # E
-# 주식: F~H = 재원, I~K = 차성, L~N = 적연 (각각 주 수 / 투자금 / 상승률)
-EQUIP_STOCK_COLS: Dict[str, Tuple[int, int, int]] = {
-    '재원': (6, 7, 8),     # F, G, H
-    '차성': (9, 10, 11),   # I, J, K
-    '적연': (12, 13, 14),  # L, M, N
+# 주식: F/G = 재원, H/I = 차성, J/K = 적연 (각각 주 수 / 투자금)
+# 시세·상승률은 stock_engine(JSON)에서만 산출 — 시트에는 상승률 컬럼 없음.
+EQUIP_STOCK_COLS: Dict[str, Tuple[int, int]] = {
+    '재원': (6, 7),    # F, G
+    '차성': (8, 9),    # H, I
+    '적연': (10, 11),  # J, K
 }
 EQUIP_DATA_START_ROW = 2  # 1행은 헤더
 
@@ -73,11 +74,17 @@ SHOP_COL_NAME = 1     # A
 SHOP_COL_PRICE = 2    # B
 SHOP_COL_STOCK = 3    # C
 
-# '전투용 정보' — 2행 header, 3행~ 데이터 (사용자 정정).
-# A열 칭호, B열~ 다양한 스탯 (헤더 텍스트로 매칭).
+# '전투용 정보' — 2행 header, 3행~ 데이터.
+# A열 칭호. 고정 컬럼: H~L = 근력/민첩/지능/행운/정신 (상태창에서 사용).
+# 그 외 임의 스탯은 헤더 텍스트로 매칭 ([판정/스탯명] 명령용).
 COMBAT_HEADER_ROW = 2
 COMBAT_DATA_START_ROW = 3
 COMBAT_COL_TITLE = 1
+COMBAT_COL_STR = 8     # H 근력
+COMBAT_COL_DEX = 9     # I 민첩
+COMBAT_COL_INT = 10    # J 지능
+COMBAT_COL_LUK = 11    # K 행운
+COMBAT_COL_MEN = 12    # L 정신
 
 
 # ======================================================================

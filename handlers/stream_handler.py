@@ -458,6 +458,12 @@ class BotStreamHandler(mastodon.StreamListener):
 
             # 성공한 경우 메시지 길이에 따라 처리
             formatted_message = config.format_response(command_result.get_user_message())
+
+            # 빈 메시지면 송신 생략 (예: [점호] 시간 외 호출 — 의도적 침묵)
+            if not formatted_message or not formatted_message.strip():
+                logger.debug("빈 응답 - 전송 생략 (의도적 무응답)")
+                return
+
             full_message = f"{mentions} {formatted_message}"
             message_length = len(full_message)
 
