@@ -69,10 +69,11 @@ BOT_INFO_COL_ITEM_NAME = 13  # M
 BOT_INFO_COL_ITEM_QTY = 14   # N
 
 # '상점' — 1행 header, 2행~ 데이터
+# 컬럼 배치: A=이름, C=재고, D=가격. (B/E는 봇이 사용 안 함 — 설명/효과 등)
 SHOP_DATA_START_ROW = 2
 SHOP_COL_NAME = 1     # A
-SHOP_COL_PRICE = 2    # B
 SHOP_COL_STOCK = 3    # C
+SHOP_COL_PRICE = 4    # D
 
 # '전투용 정보' — 2행 header, 3행~ 데이터.
 # A열 칭호. 고정 컬럼: H~L = 근력/민첩/지능/행운/정신 (상태창에서 사용).
