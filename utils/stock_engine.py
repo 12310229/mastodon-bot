@@ -36,7 +36,7 @@ from utils.logging_config import logger
 # 설정 상수
 # ======================================================================
 STOCK_NAMES: Tuple[str, ...] = ('재원', '차성', '적연')
-INITIAL_PRICE = 1000
+INITIAL_PRICE = 20
 PRICE_FLOOR = 1
 UPDATE_INTERVAL_SECONDS = 6 * 60 * 60   # 6시간
 HISTORY_KEEP_CYCLES = 8                  # 48시간 분량 (24h 비교에 4번째 사용)
