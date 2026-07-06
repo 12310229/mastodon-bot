@@ -7,8 +7,10 @@
 동작:
 - 매매 (buy/sell): 시트에서 현재가 읽음 → 봇 메모리의 매수/매도 카운터 증가.
                    시트에 매매 카운터는 쓰지 않음 (매매마다 write API 호출 없음).
-- 3시간 사이클: 봇 메모리의 카운터로 가격 갱신 → 시트에 batch write → 카운터 리셋.
+- 갱신 사이클: KST 정각 00/06/12/18 에 봇 메모리의 카운터로 가격 갱신
+              → 시트에 batch write → 카운터 리셋.
 - 시세 조회 (get_all_snapshots / get_price): 시트에서 즉시 읽음.
+- Q5 유지여부: 시트의 Q5 셀 값이 1 이면 그 사이클을 스킵 (동결).
 
 산식:
     base     = uniform(-1, 1)
@@ -17,8 +19,8 @@
     new_price = max(PRICE_FLOOR, round(before × (1 + delta)))
 
 주요 상수:
-- PRICE_FLOOR = 10          (절대 최저가)
-- UPDATE_INTERVAL_SECONDS = 3h
+- PRICE_FLOOR = 1           (절대 최저가)
+- UPDATE_KST_HOURS = (0, 6, 12, 18)   (갱신 시각, KST)
 - INITIAL_PRICE = 20        (시트가 비어있을 때만 씨앗값)
 
 24h 상승률은 봇 메모리의 히스토리로 계산 (재시작 시 리셋).
@@ -29,7 +31,15 @@ from __future__ import annotations
 import random
 import threading
 import time
+from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
+
+try:
+    import pytz
+    _KST = pytz.timezone('Asia/Seoul')
+except ImportError:
+    pytz = None
+    _KST = None
 
 from utils.logging_config import logger
 from utils.shared_sheet import (
@@ -44,13 +54,36 @@ from utils.shared_sheet import (
 # ======================================================================
 # 설정 상수
 # ======================================================================
-STOCK_NAMES: Tuple[str, ...] = ('재원', '차성', '적연')
-INITIAL_PRICE = 20
-PRICE_FLOOR = 1
-UPDATE_INTERVAL_SECONDS = 6 * 60 * 60   # 6시간
-HISTORY_KEEP_CYCLES = 8                  # 48시간 분량 (24h 비교에 4번째 사용)
-DAILY_COMPARE_INDEX = 4                  # 24h = 4 × 6h 사이클
+INITIAL_PRICE = 20                    # 시트 비어있을 때만 씨앗값
+PRICE_FLOOR = 1                       # 절대 최저가
+# 갱신은 KST 절대 시각 00/06/12/18 정각에 실행. 아래 슬롯 리스트로 정의.
+UPDATE_KST_HOURS: Tuple[int, ...] = (0, 6, 12, 18)
+HISTORY_KEEP_CYCLES = 8               # 6h × 8 = 48h 분량
+DAILY_COMPARE_INDEX = 4               # 24h = 4 사이클 전
 PRESSURE_WEIGHT = 0.5
+
+
+def _next_kst_slot_ts() -> float:
+    """다음 KST 정각(00/06/12/18) 의 UTC timestamp 반환.
+
+    지금이 정확히 정각인 경우엔 다음 슬롯으로 넘어감(같은 정각의 중복 발화 방지).
+    """
+    if _KST is not None:
+        now_kst = datetime.now(_KST)
+    else:
+        # pytz 미설치 (아주 예외적) — 로컬 TZ 를 KST 로 가정.
+        now_kst = datetime.now()
+
+    for hour in UPDATE_KST_HOURS:
+        candidate = now_kst.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if candidate > now_kst:
+            return candidate.timestamp()
+
+    # 오늘의 모든 슬롯이 지났으면 내일 00:00.
+    tomorrow_zero = (now_kst + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    return tomorrow_zero.timestamp()
 
 
 class StockEngine:
@@ -151,7 +184,7 @@ class StockEngine:
         return (price, price * quantity)
 
     # ------------------------------------------------------------------
-    # 가격 갱신 (3h 사이클)
+    # 가격 갱신 (KST 정각 사이클)
     # ------------------------------------------------------------------
 
     def _apply_cycle(self) -> List[Tuple[str, int, int]]:
@@ -236,8 +269,8 @@ class StockEngine:
         )
         self._thread.start()
         logger.info(
-            f"[stock] 백그라운드 스레드 시작 (주기={UPDATE_INTERVAL_SECONDS}s, "
-            f"floor={PRICE_FLOOR}G)"
+            f"[stock] 백그라운드 스레드 시작 "
+            f"(갱신 시각 KST {UPDATE_KST_HOURS}, floor={PRICE_FLOOR}G)"
         )
 
     def stop(self) -> None:
@@ -248,17 +281,21 @@ class StockEngine:
         logger.debug("[stock] 백그라운드 스레드 종료")
 
     def _run_loop(self) -> None:
-        """3시간마다 사이클 실행. stop 이벤트로 즉시 종료 가능."""
-        with self._lock:
-            if self._last_update_ts <= 0:
-                self._last_update_ts = time.time()
-
+        """KST 정각(00/06/12/18) 마다 사이클 실행. stop 이벤트로 즉시 종료 가능."""
         while not self._stop_event.is_set():
-            with self._lock:
-                next_fire = self._last_update_ts + UPDATE_INTERVAL_SECONDS
+            next_fire = _next_kst_slot_ts()
             now = time.time()
             wait_s = max(1.0, next_fire - now)
 
+            # 로그로 다음 갱신 시각 알림 (긴 대기의 경우만)
+            if wait_s > 60 and _KST is not None:
+                next_dt = datetime.fromtimestamp(next_fire, tz=_KST)
+                logger.info(
+                    f"[stock] 다음 갱신 대기 → {next_dt:%Y-%m-%d %H:%M KST} "
+                    f"({int(wait_s // 60)}분 후)"
+                )
+
+            # 짧은 sleep 반복 — stop 응답성 확보
             slept = 0.0
             while slept < wait_s and not self._stop_event.is_set():
                 step = min(0.5, wait_s - slept)
