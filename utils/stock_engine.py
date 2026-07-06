@@ -44,9 +44,12 @@ except ImportError:
 from utils.logging_config import logger
 from utils.shared_sheet import (
     STOCK_NAMES,
+    clear_stock_previews,
     ensure_stock_sheet_initialized,
     read_stock_hold_switch,
+    read_stock_previews,
     read_stock_prices,
+    write_stock_previews,
     write_stock_prices,
 )
 
@@ -58,9 +61,23 @@ INITIAL_PRICE = 20                    # 시트 비어있을 때만 씨앗값
 PRICE_FLOOR = 1                       # 절대 최저가
 # 갱신은 KST 절대 시각 00/06/12/18 정각에 실행. 아래 슬롯 리스트로 정의.
 UPDATE_KST_HOURS: Tuple[int, ...] = (0, 6, 12, 18)
+PREVIEW_LEAD_SECONDS = 30 * 60        # 정각 30분 전에 다음 사이클 예상가 계산 → R열
 HISTORY_KEEP_CYCLES = 8               # 6h × 8 = 48h 분량
 DAILY_COMPARE_INDEX = 4               # 24h = 4 사이클 전
-PRESSURE_WEIGHT = 0.5
+PRESSURE_WEIGHT = 0.7                 # 매수/매도 압력 가중치 (기존 0.5)
+
+# 연속 하락 → 강제 상승 로직
+FORCED_RALLY_THRESHOLD = 4            # N 회 연속 하락 시 다음 사이클 강제 상승
+FORCED_RALLY_MIN_DELTA = 0.5          # 강제 상승 시 최소 상승률 (+50%)
+
+# 상장폐지 로직
+DELIST_TRIGGER_PRICE = 2              # 강제 상승 결과 이 가격이면 다음 사이클 상장폐지 감시
+DELIST_RECOVERY_PRICE = 10            # 상장폐지 후 다음 사이클에 이 가격으로 재상장
+
+# 종목 페이즈
+PHASE_NORMAL = 'normal'
+PHASE_DELIST_WATCH = 'watch'          # 다음 사이클 매도 비율 ≥50% 시 상장폐지 발동
+PHASE_DELISTED = 'delisted'           # 이번 사이클 결과가 0G, 다음 사이클에 재상장
 
 
 def _next_kst_slot_ts() -> float:
@@ -101,6 +118,10 @@ class StockEngine:
         self._buys: Dict[str, int] = {n: 0 for n in STOCK_NAMES}
         self._sells: Dict[str, int] = {n: 0 for n in STOCK_NAMES}
         self._history: Dict[str, List[int]] = {n: [] for n in STOCK_NAMES}
+        # 연속 하락 카운터 (4회 이상 시 다음 사이클에 강제 상승)
+        self._consecutive_drops: Dict[str, int] = {n: 0 for n in STOCK_NAMES}
+        # 종목별 페이즈 (정상 / 폐지감시 / 폐지)
+        self._phase: Dict[str, str] = {n: PHASE_NORMAL for n in STOCK_NAMES}
 
     # ------------------------------------------------------------------
     # 시트 I/O 래퍼
@@ -184,50 +205,275 @@ class StockEngine:
         return (price, price * quantity)
 
     # ------------------------------------------------------------------
-    # 가격 갱신 (KST 정각 사이클)
+    # 가격 갱신 (KST 정각 사이클) — 2단계
+    #   1) precompute (정각 30분 전): 예상가 계산 → R2:R4 기록.
+    #      페이즈 전이·카운터 리셋·시트 초기화(상장폐지 시)도 이때.
+    #   2) commit (정각): R2:R4 읽어서 Q2:Q4 에 그대로 복사.
+    #      관리자가 30분 사이 R값을 수정하면 그 값이 그대로 반영됨.
     # ------------------------------------------------------------------
 
-    def _apply_cycle(self) -> List[Tuple[str, int, int]]:
-        """한 사이클 실행. `[(이름, before, after), ...]`. 락 보유 전제.
+    def _precompute_next_cycle(self) -> List[Tuple[str, int, int]]:
+        """
+        다음 사이클의 예상가를 계산해 R2:R4 에 기록.
 
-        Q5 유지여부 셀 값이 1 이면 사이클 전체를 스킵 (가격 그대로, 카운터도 유지).
-        관리자가 시장을 얼어붙게 하고 싶을 때 사용.
+        페이즈 전이 / 카운터 리셋 / 히스토리 push / 상장폐지 시 캐릭터 시트
+        초기화까지 여기서 확정. 관리자는 R 값(숫자)만 수정 가능하며,
+        페이즈 이벤트(폐지·재상장) 는 취소되지 않는다.
+
+        반환: `[(이름, 현재가, 예상가), ...]`.
+        """
+        # Q5 유지여부 = 1 이면 예상가 = 현재가 (동결).
+        if self._sheets_manager is not None and read_stock_hold_switch(self._sheets_manager):
+            prices_now = self._read_prices()
+            preview = {name: prices_now.get(name, PRICE_FLOOR) for name in STOCK_NAMES}
+            for name in STOCK_NAMES:
+                self._push_history(name, preview[name])
+            self._write_previews(preview)
+            logger.info("[stock] 프리뷰(동결): 유지여부(Q5)=1 → 예상가 = 현재가")
+            return [(name, preview[name], preview[name]) for name in STOCK_NAMES]
+
+        prices_before = self._read_prices()
+        preview: Dict[str, int] = {}
+        results: List[Tuple[str, int, int]] = []
+
+        for name in STOCK_NAMES:
+            before = prices_before.get(name, PRICE_FLOOR)
+            buys = self._buys[name]
+            sells = self._sells[name]
+            total_volume = buys + sells
+            phase = self._phase[name]
+
+            # --- 2) 상장폐지 후 재상장 ---
+            if phase == PHASE_DELISTED:
+                new_price = DELIST_RECOVERY_PRICE
+                self._phase[name] = PHASE_NORMAL
+                self._consecutive_drops[name] = 0
+                logger.info(f"[stock][프리뷰] {name} 재상장 예상 → {new_price}G")
+                preview[name] = new_price
+                self._buys[name] = 0
+                self._sells[name] = 0
+                self._push_history(name, new_price)
+                results.append((name, before, new_price))
+                continue
+
+            # --- 3) 상장폐지 발동 판정 ---
+            if (phase == PHASE_DELIST_WATCH
+                    and total_volume > 0
+                    and sells * 2 >= total_volume):
+                new_price = 0
+                self._phase[name] = PHASE_DELISTED
+                self._consecutive_drops[name] = 0
+                logger.warning(
+                    f"[stock][프리뷰] {name} 상장폐지 확정! "
+                    f"(매도 {sells} / 총매매 {total_volume}) → 0G"
+                )
+                self._delist_all_holders(name)
+                preview[name] = new_price
+                self._buys[name] = 0
+                self._sells[name] = 0
+                self._push_history(name, new_price)
+                results.append((name, before, new_price))
+                continue
+
+            # --- 4) 정상 계산 (강제 상승 포함) ---
+            base = random.uniform(-1.0, 1.0)
+            pressure = (buys - sells) / (total_volume + 1)
+            raw_delta = base + PRESSURE_WEIGHT * pressure
+
+            forced_rally = self._consecutive_drops[name] >= FORCED_RALLY_THRESHOLD
+            if forced_rally:
+                delta = max(FORCED_RALLY_MIN_DELTA, min(1.0, raw_delta))
+            else:
+                delta = max(-1.0, min(1.0, raw_delta))
+
+            new_price = max(PRICE_FLOOR, int(round(before * (1.0 + delta))))
+
+            if forced_rally:
+                self._consecutive_drops[name] = 0
+                logger.info(
+                    f"[stock][프리뷰] {name} 강제 상승 발동 ({before} → {new_price}, +{delta*100:.0f}%)"
+                )
+            elif new_price < before:
+                self._consecutive_drops[name] += 1
+            else:
+                self._consecutive_drops[name] = 0
+
+            if phase == PHASE_DELIST_WATCH:
+                self._phase[name] = PHASE_NORMAL
+                logger.info(f"[stock][프리뷰] {name} 폐지 감시 해제 (매도 부족)")
+            if forced_rally and new_price == DELIST_TRIGGER_PRICE:
+                self._phase[name] = PHASE_DELIST_WATCH
+                logger.info(
+                    f"[stock][프리뷰] {name} 폐지 감시 진입 "
+                    f"(다음 사이클 매도 ≥50% 시 상장폐지)"
+                )
+
+            preview[name] = new_price
+            self._buys[name] = 0
+            self._sells[name] = 0
+            self._push_history(name, new_price)
+            results.append((name, before, new_price))
+
+        self._write_previews(preview)
+        return results
+
+    def _write_previews(self, prices: Dict[str, int]) -> None:
+        if self._sheets_manager is None:
+            return
+        try:
+            ok = write_stock_previews(self._sheets_manager, prices)
+            if not ok:
+                logger.warning("[stock][프리뷰] R 열 기록 실패 (다음 정각에 재시도 안 됨)")
+        except Exception as e:
+            logger.warning(f"[stock][프리뷰] R 열 기록 예외: {e}")
+
+    def _commit_from_preview(self) -> List[Tuple[str, int, int]]:
+        """
+        정각에 R2:R4 → Q2:Q4 복사. 관리자가 수정한 값 그대로 반영.
+        반환: `[(이름, before, after), ...]`.
+        """
+        if self._sheets_manager is None:
+            return []
+
+        prices_before = self._read_prices()
+        previews = read_stock_previews(self._sheets_manager)
+
+        prices_after: Dict[str, int] = {}
+        results: List[Tuple[str, int, int]] = []
+        for name in STOCK_NAMES:
+            before = prices_before.get(name, PRICE_FLOOR)
+            preview = previews.get(name)
+            if preview is None:
+                # 프리뷰 값이 없으면 현재가 유지 (안전).
+                logger.warning(f"[stock][커밋] {name} 예상가 셀이 비어있음 — 현재가 유지")
+                after = before
+            else:
+                # 관리자가 극단값으로 조작했을 수 있음 — floor 만 강제.
+                after = max(PRICE_FLOOR, int(preview)) if preview > 0 else int(preview)
+            prices_after[name] = after
+            results.append((name, before, after))
+
+            # 히스토리 마지막 항목을 실제 커밋된 값으로 갱신 (관리자 조작 반영).
+            hist = self._history.setdefault(name, [])
+            if hist:
+                hist[-1] = after
+
+        ok = self._write_prices(prices_after)
+        if not ok:
+            logger.warning("[stock][커밋] 시트에 새 가격 저장 실패")
+
+        # R 열은 다음 사이클을 위해 비움.
+        try:
+            clear_stock_previews(self._sheets_manager)
+        except Exception as e:
+            logger.debug(f"[stock][커밋] R 열 정리 실패 (무시): {e}")
+
+        self._last_update_ts = time.time()
+        return results
+
+    def _apply_cycle_legacy(self) -> List[Tuple[str, int, int]]:
+        """[LEGACY] 한 번에 계산+커밋. 현재 스케줄러는 precompute/commit 을 분리
+        사용하므로 이 메서드는 force_update_cycle 및 하위 호환용으로만 남아있다.
+
+        처리 순서 (종목마다):
+          1) Q5 유지여부 == 1 이면 사이클 전체 스킵 (동결).
+          2) 페이즈 == DELISTED → DELIST_RECOVERY_PRICE (=10G) 로 재상장.
+          3) 페이즈 == DELIST_WATCH & 이번 사이클 매도 비율 ≥ 50%
+             → 상장폐지 (가격 0G, 모든 캐릭터의 보유/투자금 시트에서 0 초기화).
+          4) 아니면 정상 계산 — 4회 연속 하락 시 강제 상승 (+50% 이상 보장).
+          5) 강제 상승 결과 = 2G 인 경우, 다음 사이클을 위한 폐지 감시 진입.
         """
         # Q5 유지여부 스위치 확인
         if self._sheets_manager is not None and read_stock_hold_switch(self._sheets_manager):
             self._last_update_ts = time.time()
             logger.info("[stock] 유지여부(Q5)=1 — 이번 사이클 스킵 (동결)")
-            # 카운터는 리셋하지 않음: 압력이 다음 사이클로 누적됨.
-            # 히스토리에는 현재가를 다시 push (24h 상승률 계산 시 시간축 유지).
             prices_now = self._read_prices()
             for name in STOCK_NAMES:
-                hist = self._history.setdefault(name, [])
-                hist.append(prices_now.get(name, PRICE_FLOOR))
-                if len(hist) > HISTORY_KEEP_CYCLES:
-                    del hist[: len(hist) - HISTORY_KEEP_CYCLES]
-            return []  # 갱신 없음 표시 (post_update_callback 도 빈 리스트 수신)
+                self._push_history(name, prices_now.get(name, PRICE_FLOOR))
+            return []
 
         prices_before = self._read_prices()
         prices_after: Dict[str, int] = {}
         results: List[Tuple[str, int, int]] = []
+
         for name in STOCK_NAMES:
             before = prices_before.get(name, PRICE_FLOOR)
             buys = self._buys[name]
             sells = self._sells[name]
+            total_volume = buys + sells
+            phase = self._phase[name]
+
+            # --- 2) 상장폐지 후 재상장 ---
+            if phase == PHASE_DELISTED:
+                new_price = DELIST_RECOVERY_PRICE
+                self._phase[name] = PHASE_NORMAL
+                self._consecutive_drops[name] = 0
+                logger.info(f"[stock] {name} 재상장 → {new_price}G")
+                prices_after[name] = new_price
+                self._buys[name] = 0
+                self._sells[name] = 0
+                self._push_history(name, new_price)
+                results.append((name, before, new_price))
+                continue
+
+            # --- 3) 상장폐지 발동 판정 ---
+            if (phase == PHASE_DELIST_WATCH
+                    and total_volume > 0
+                    and sells * 2 >= total_volume):  # sells ≥ 50%
+                new_price = 0
+                self._phase[name] = PHASE_DELISTED
+                self._consecutive_drops[name] = 0
+                logger.warning(
+                    f"[stock] {name} 상장폐지! (매도 {sells} / 총매매 {total_volume}) → 0G"
+                )
+                self._delist_all_holders(name)
+                prices_after[name] = new_price
+                self._buys[name] = 0
+                self._sells[name] = 0
+                self._push_history(name, new_price)
+                results.append((name, before, new_price))
+                continue
+
+            # --- 4) 정상 계산 (강제 상승 포함) ---
             base = random.uniform(-1.0, 1.0)
-            total = buys + sells
-            pressure = (buys - sells) / (total + 1)
-            delta = max(-1.0, min(1.0, base + PRESSURE_WEIGHT * pressure))
+            pressure = (buys - sells) / (total_volume + 1)
+            raw_delta = base + PRESSURE_WEIGHT * pressure
+
+            forced_rally = self._consecutive_drops[name] >= FORCED_RALLY_THRESHOLD
+            if forced_rally:
+                delta = max(FORCED_RALLY_MIN_DELTA, min(1.0, raw_delta))
+            else:
+                delta = max(-1.0, min(1.0, raw_delta))
+
             new_price = max(PRICE_FLOOR, int(round(before * (1.0 + delta))))
+
+            # --- 하락 카운터 갱신 ---
+            if forced_rally:
+                self._consecutive_drops[name] = 0
+                logger.info(
+                    f"[stock] {name} 강제 상승 발동 ({before} → {new_price}, +{delta*100:.0f}%)"
+                )
+            elif new_price < before:
+                self._consecutive_drops[name] += 1
+            else:
+                self._consecutive_drops[name] = 0
+
+            # --- 5) 페이즈 전이 ---
+            # 폐지감시 상태였는데 매도 비율 부족 → 감시 해제
+            if phase == PHASE_DELIST_WATCH:
+                self._phase[name] = PHASE_NORMAL
+                logger.info(f"[stock] {name} 폐지 감시 해제 (매도 부족)")
+            # 강제 상승 결과 = 2G면 다음 사이클 폐지 감시
+            if forced_rally and new_price == DELIST_TRIGGER_PRICE:
+                self._phase[name] = PHASE_DELIST_WATCH
+                logger.info(
+                    f"[stock] {name} 폐지 감시 진입 (다음 사이클 매도 ≥50% 시 상장폐지)"
+                )
+
             prices_after[name] = new_price
-
-            hist = self._history.setdefault(name, [])
-            hist.append(new_price)
-            if len(hist) > HISTORY_KEEP_CYCLES:
-                del hist[: len(hist) - HISTORY_KEEP_CYCLES]
-
             self._buys[name] = 0
             self._sells[name] = 0
+            self._push_history(name, new_price)
             results.append((name, before, new_price))
 
         ok = self._write_prices(prices_after)
@@ -236,10 +482,68 @@ class StockEngine:
         self._last_update_ts = time.time()
         return results
 
+    def _push_history(self, name: str, price: int) -> None:
+        """히스토리에 push + 사이즈 제한."""
+        hist = self._history.setdefault(name, [])
+        hist.append(price)
+        if len(hist) > HISTORY_KEEP_CYCLES:
+            del hist[: len(hist) - HISTORY_KEEP_CYCLES]
+
+    def _delist_all_holders(self, name: str) -> None:
+        """상장폐지: '장비 및 주식' 시트에서 모든 캐릭터의 이 종목 주 수/투자금을 0 으로.
+
+        투자금 회수는 불가 (사양). 골드는 이미 매도 시점에 받은 금액이 반영됐으므로
+        별도 조정 없음.
+        """
+        if self._sheets_manager is None:
+            return
+        # 순환 import 방지 — 함수 내부에서 지연 import.
+        from utils.shared_sheet import (
+            EQUIP_DATA_START_ROW,
+            EQUIP_STOCK_COLS,
+            WS_EQUIP_STOCK,
+        )
+        cols = EQUIP_STOCK_COLS.get(name)
+        if cols is None:
+            return
+        shares_col, invest_col = cols
+
+        try:
+            ws = self._sheets_manager.get_worksheet(WS_EQUIP_STOCK)
+            all_values = ws.get_all_values()
+        except Exception as e:
+            logger.warning(f"[stock] 상장폐지 시트 조회 실패 ({name}): {e}")
+            return
+
+        updates = []
+        for idx, row_values in enumerate(all_values, start=1):
+            if idx < EQUIP_DATA_START_ROW:
+                continue
+            if not row_values:
+                continue
+            title = (row_values[0] or '').strip() if len(row_values) >= 1 else ''
+            if not title:
+                continue
+            cur_shares = row_values[shares_col - 1] if len(row_values) >= shares_col else ''
+            cur_invest = row_values[invest_col - 1] if len(row_values) >= invest_col else ''
+            if str(cur_shares).strip() not in ('', '0'):
+                updates.append((idx, shares_col, '0'))
+            if str(cur_invest).strip() not in ('', '0'):
+                updates.append((idx, invest_col, '0'))
+
+        if not updates:
+            return
+        ok = self._sheets_manager.batch_update_cells(WS_EQUIP_STOCK, updates)
+        if ok:
+            logger.info(f"[stock] 상장폐지 시트 초기화 ({name}): {len(updates)}셀")
+        else:
+            logger.warning(f"[stock] 상장폐지 시트 초기화 실패 ({name})")
+
     def force_update_cycle(self) -> List[Tuple[str, int, int]]:
-        """디버깅/수동 트리거용."""
+        """디버깅/수동 트리거용. precompute + commit 을 즉시 순차 실행."""
         with self._lock:
-            results = self._apply_cycle()
+            self._precompute_next_cycle()
+            results = self._commit_from_preview()
         for name, before, after in results:
             logger.info(f"[stock] 강제 사이클: {name} {before} → {after}")
         return results
@@ -281,40 +585,67 @@ class StockEngine:
         logger.debug("[stock] 백그라운드 스레드 종료")
 
     def _run_loop(self) -> None:
-        """KST 정각(00/06/12/18) 마다 사이클 실행. stop 이벤트로 즉시 종료 가능."""
+        """KST 정각(00/06/12/18) 스케줄:
+          1) 정각 30분 전에 precompute (예상가 → R2:R4).
+          2) 정각에 commit (R → Q 복사).
+        stop 이벤트로 즉시 종료 가능.
+        """
         while not self._stop_event.is_set():
             next_fire = _next_kst_slot_ts()
-            now = time.time()
-            wait_s = max(1.0, next_fire - now)
+            preview_time = next_fire - PREVIEW_LEAD_SECONDS
 
-            # 로그로 다음 갱신 시각 알림 (긴 대기의 경우만)
-            if wait_s > 60 and _KST is not None:
-                next_dt = datetime.fromtimestamp(next_fire, tz=_KST)
-                logger.info(
-                    f"[stock] 다음 갱신 대기 → {next_dt:%Y-%m-%d %H:%M KST} "
-                    f"({int(wait_s // 60)}분 후)"
-                )
-
-            # 짧은 sleep 반복 — stop 응답성 확보
-            slept = 0.0
-            while slept < wait_s and not self._stop_event.is_set():
-                step = min(0.5, wait_s - slept)
-                time.sleep(step)
-                slept += step
-
-            if self._stop_event.is_set():
+            # (1) preview 시각까지 대기 (이미 지났으면 즉시 진행)
+            if not self._sleep_until(preview_time, log_prefix='다음 프리뷰'):
                 break
 
+            # (2) precompute — 예상가 계산 + R 열 기록
             with self._lock:
-                results = self._apply_cycle()
+                preview_results = self._precompute_next_cycle()
+            if _KST is not None:
+                fire_dt = datetime.fromtimestamp(next_fire, tz=_KST)
+                logger.info(
+                    f"[stock] 프리뷰 완료 → {fire_dt:%H:%M KST} 커밋 예정. "
+                    "R 열을 확인/수정하세요."
+                )
+            for name, before, after in preview_results:
+                logger.info(f"[stock][프리뷰] {name}: {before} → {after}")
+
+            # (3) 정각까지 대기
+            if not self._sleep_until(next_fire, log_prefix='다음 커밋'):
+                break
+
+            # (4) commit — R2:R4 → Q2:Q4
+            with self._lock:
+                results = self._commit_from_preview()
             for name, before, after in results:
-                logger.info(f"[stock] 주기 갱신: {name} {before} → {after}")
+                logger.info(f"[stock][커밋] {name}: {before} → {after}")
 
             if self._callback:
                 try:
                     self._callback(results)
                 except Exception as e:
                     logger.warning(f"[stock] post_update_callback 실패: {e}")
+
+    def _sleep_until(self, target_ts: float, log_prefix: str = '') -> bool:
+        """target_ts 까지 짧은 sleep 반복. stop 이벤트로 즉시 종료. 반환: False=stop, True=완료."""
+        now = time.time()
+        wait_s = target_ts - now
+        if wait_s <= 0:
+            return not self._stop_event.is_set()
+
+        if wait_s > 60 and _KST is not None and log_prefix:
+            dt = datetime.fromtimestamp(target_ts, tz=_KST)
+            logger.info(
+                f"[stock] {log_prefix} 대기 → {dt:%Y-%m-%d %H:%M KST} "
+                f"({int(wait_s // 60)}분 후)"
+            )
+
+        slept = 0.0
+        while slept < wait_s and not self._stop_event.is_set():
+            step = min(0.5, wait_s - slept)
+            time.sleep(step)
+            slept += step
+        return not self._stop_event.is_set()
 
 
 # ======================================================================
