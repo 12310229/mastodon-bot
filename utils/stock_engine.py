@@ -44,11 +44,12 @@ from utils.shared_sheet import (
 # ======================================================================
 # 설정 상수
 # ======================================================================
-INITIAL_PRICE = 20                    # 시트 비어있을 때만 씨앗값
-PRICE_FLOOR = 5                       # 절대 최저가
-UPDATE_INTERVAL_SECONDS = 6 * 60 * 60 # 6시간
-HISTORY_KEEP_CYCLES = 8               # 6h × 8 = 48h 분량
-DAILY_COMPARE_INDEX = 4               # 24h = 4 사이클 전
+STOCK_NAMES: Tuple[str, ...] = ('재원', '차성', '적연')
+INITIAL_PRICE = 20
+PRICE_FLOOR = 1
+UPDATE_INTERVAL_SECONDS = 6 * 60 * 60   # 6시간
+HISTORY_KEEP_CYCLES = 8                  # 48시간 분량 (24h 비교에 4번째 사용)
+DAILY_COMPARE_INDEX = 4                  # 24h = 4 × 6h 사이클
 PRESSURE_WEIGHT = 0.5
 
 
