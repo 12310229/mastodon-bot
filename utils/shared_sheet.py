@@ -63,10 +63,21 @@ RAID_COL_MP_CUR = 13      # M 현재 MP
 RAID_COL_MP_MAX = 14      # N 최대 MP
 
 # '자동봇용 정보' — 1행 header, 2행~ 데이터
-# 주식 상태는 JSON 로컬 영속화만 사용. 시트 미러 없음 (API 호출 절약).
+# M/N: 공동 창고 (아이템 이름/수량)
+# P/Q: 주식 (종목명/현재가). 관리자가 Q 열을 직접 수정하면 주가 조작 가능.
 BOT_INFO_DATA_START_ROW = 2
 BOT_INFO_COL_ITEM_NAME = 13  # M
 BOT_INFO_COL_ITEM_QTY = 14   # N
+BOT_INFO_COL_STOCK_NAME = 16   # P
+BOT_INFO_COL_STOCK_PRICE = 17  # Q
+
+# 주식 종목별 고정 행 (2/3/4). 종목명은 P열 헤더 아래에 이 순서대로 기록.
+STOCK_NAMES: Tuple[str, ...] = ('재원', '차성', '적연')
+STOCK_ROW_BY_NAME: Dict[str, int] = {name: 2 + i for i, name in enumerate(STOCK_NAMES)}
+
+# 주가 동결 스위치. P5='유지여부' 라벨, Q5=값. Q5 값이 정확히 1이면 사이클 스킵.
+BOT_INFO_STOCK_HOLD_ROW = 5
+BOT_INFO_STOCK_HOLD_LABEL = '유지여부'
 
 # '상점' — 1행 header, 2행~ 데이터
 # 컬럼 배치: A=이름, C=재고, D=가격. (B/E는 봇이 사용 안 함 — 설명/효과 등)
@@ -486,3 +497,154 @@ def get_combat_stat(
         except (TypeError, ValueError):
             return None
     return None
+
+
+# ======================================================================
+# 주식 시세 시트 I/O ('자동봇용 정보' P/Q열)
+# ======================================================================
+
+def read_stock_prices(sheets_manager: SheetsManager) -> Dict[str, Optional[int]]:
+    """
+    '자동봇용 정보'의 Q2~Q4를 batch로 읽어 `{종목: 가격}` 반환.
+
+    시트 값이 비었거나 정수가 아니면 None. 호출자가 초기 씨앗값으로 대체.
+    """
+    result: Dict[str, Optional[int]] = {name: None for name in STOCK_NAMES}
+    try:
+        ws = sheets_manager.get_worksheet(WS_BOT_INFO)
+    except Exception as e:
+        logger.warning(f"[shared_sheet] 주가 워크시트 조회 실패: {e}")
+        return result
+
+    cells = [(STOCK_ROW_BY_NAME[n], BOT_INFO_COL_STOCK_PRICE) for n in STOCK_NAMES]
+    values = sheets_manager.batch_get_cells_safe(ws, cells)
+    if values is None:
+        # batch_get 미지원 폴백 — 개별 셀 읽기.
+        values = [
+            sheets_manager.get_cell_value_safe(ws, row, col)
+            for row, col in cells
+        ]
+
+    for name, raw in zip(STOCK_NAMES, values):
+        if raw is None or str(raw).strip() == '':
+            continue
+        try:
+            result[name] = int(str(raw).strip())
+        except (TypeError, ValueError):
+            result[name] = None
+    return result
+
+
+def write_stock_prices(
+    sheets_manager: SheetsManager, prices: Dict[str, int],
+) -> bool:
+    """`{종목: 가격}`을 시트에 batch 쓰기 (Q2/Q3/Q4)."""
+    updates = []
+    for name, price in prices.items():
+        row = STOCK_ROW_BY_NAME.get(name)
+        if row is None:
+            continue
+        updates.append((row, BOT_INFO_COL_STOCK_PRICE, str(int(price))))
+    if not updates:
+        return True
+    return sheets_manager.batch_update_cells(WS_BOT_INFO, updates)
+
+
+def ensure_stock_sheet_initialized(
+    sheets_manager: SheetsManager, initial_price: int,
+) -> None:
+    """
+    부팅 시 1회 호출: 시트에 헤더/종목명/초기가/유지여부 셀이 없으면 채워 넣기.
+    이미 값이 있으면 그대로 유지 (사용자가 조작한 값 존중).
+    """
+    try:
+        ws = sheets_manager.get_worksheet(WS_BOT_INFO)
+    except Exception as e:
+        logger.warning(f"[shared_sheet] 주가 시트 초기화 스킵: {e}")
+        return
+
+    # 헤더 (P1/Q1)
+    header_cells = [
+        (1, BOT_INFO_COL_STOCK_NAME),
+        (1, BOT_INFO_COL_STOCK_PRICE),
+    ]
+    header_values = sheets_manager.batch_get_cells_safe(ws, header_cells)
+    if header_values is None:
+        header_values = [
+            sheets_manager.get_cell_value_safe(ws, r, c) for r, c in header_cells
+        ]
+
+    updates = []
+    if not (header_values and str(header_values[0] or '').strip()):
+        updates.append((1, BOT_INFO_COL_STOCK_NAME, '종목'))
+    if not (header_values and str(header_values[1] or '').strip()):
+        updates.append((1, BOT_INFO_COL_STOCK_PRICE, '현재가'))
+
+    # 종목명 (P2/P3/P4)
+    name_cells = [(STOCK_ROW_BY_NAME[n], BOT_INFO_COL_STOCK_NAME) for n in STOCK_NAMES]
+    name_values = sheets_manager.batch_get_cells_safe(ws, name_cells)
+    if name_values is None:
+        name_values = [
+            sheets_manager.get_cell_value_safe(ws, r, c) for r, c in name_cells
+        ]
+    for name, raw in zip(STOCK_NAMES, name_values or []):
+        if not (raw and str(raw).strip() == name):
+            updates.append((STOCK_ROW_BY_NAME[name], BOT_INFO_COL_STOCK_NAME, name))
+
+    # 초기 가격 (Q2/Q3/Q4) — 비어 있는 것만 채움
+    price_cells = [(STOCK_ROW_BY_NAME[n], BOT_INFO_COL_STOCK_PRICE) for n in STOCK_NAMES]
+    price_values = sheets_manager.batch_get_cells_safe(ws, price_cells)
+    if price_values is None:
+        price_values = [
+            sheets_manager.get_cell_value_safe(ws, r, c) for r, c in price_cells
+        ]
+    for name, raw in zip(STOCK_NAMES, price_values or []):
+        if raw is None or str(raw).strip() == '':
+            updates.append((STOCK_ROW_BY_NAME[name], BOT_INFO_COL_STOCK_PRICE, str(initial_price)))
+
+    # 유지여부 스위치 (P5 라벨 / Q5 값) — 비어 있으면 채움. 기존 값 존중.
+    hold_cells = [
+        (BOT_INFO_STOCK_HOLD_ROW, BOT_INFO_COL_STOCK_NAME),
+        (BOT_INFO_STOCK_HOLD_ROW, BOT_INFO_COL_STOCK_PRICE),
+    ]
+    hold_values = sheets_manager.batch_get_cells_safe(ws, hold_cells)
+    if hold_values is None:
+        hold_values = [
+            sheets_manager.get_cell_value_safe(ws, r, c) for r, c in hold_cells
+        ]
+    if not (hold_values and str(hold_values[0] or '').strip()):
+        updates.append(
+            (BOT_INFO_STOCK_HOLD_ROW, BOT_INFO_COL_STOCK_NAME, BOT_INFO_STOCK_HOLD_LABEL)
+        )
+    if hold_values is None or str(hold_values[1] or '').strip() == '':
+        updates.append(
+            (BOT_INFO_STOCK_HOLD_ROW, BOT_INFO_COL_STOCK_PRICE, '0')
+        )
+
+    if updates:
+        ok = sheets_manager.batch_update_cells(WS_BOT_INFO, updates)
+        if ok:
+            logger.info(f"[shared_sheet] 주가 시트 초기화: {len(updates)} 셀 채움")
+        else:
+            logger.warning("[shared_sheet] 주가 시트 초기화 실패")
+
+
+def read_stock_hold_switch(sheets_manager: SheetsManager) -> bool:
+    """Q5(유지여부) 셀 값을 읽어 `1` 이면 True. 그 외/실패는 False."""
+    try:
+        ws = sheets_manager.get_worksheet(WS_BOT_INFO)
+        raw = sheets_manager.get_cell_value_safe(
+            ws, BOT_INFO_STOCK_HOLD_ROW, BOT_INFO_COL_STOCK_PRICE,
+        )
+    except Exception as e:
+        logger.warning(f"[shared_sheet] 유지여부 셀 조회 실패: {e}")
+        return False
+    if raw is None:
+        return False
+    text = str(raw).strip()
+    if not text:
+        return False
+    try:
+        return int(text) == 1
+    except (TypeError, ValueError):
+        return False

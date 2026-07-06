@@ -1,162 +1,124 @@
 """
-주식 엔진 (재원 / 차성 / 적연)
+주식 엔진 (재원 / 차성 / 적연) — 시트 기반 저장.
 
-캐릭터와 무관한 전역 주식 시장을 시뮬레이션한다.
-- 현재가, 매수/매도 누적 카운터, 6시간 단위 가격 히스토리(24h 비교용) 를
-  JSON 파일에 영속화.
-- 백그라운드 스레드가 6시간마다 가격을 갱신:
-    base = uniform(-1.0, +1.0)
-    pressure = (buys - sells) / (buys + sells + 1)          # ∈ [-1, +1]
-    delta = clamp(base + PRESSURE_WEIGHT * pressure, -1.0, +1.0)
-    new_price = max(1, round(price * (1 + delta)))
-- 거래(buy/sell)는 동기 API. 각 호출은 락 보호하에 누적 카운터를 증가시킨다.
+가격은 '자동봇용 정보' 시트의 Q2/Q3/Q4에 저장된다. 관리자가 그 셀을 직접
+수정하면 다음 매매/조회에서 즉시 반영 = **주가 조작** 가능.
 
-설계 메모:
-- "최소 -100%~ 최대 +100% 변동" 사양을 그대로 따라 delta 를 ±1.0 으로 클램프.
-- 가격이 0 이하로 떨어지지 않도록 1 골드 최소 floor.
-- 가격*수량 결과는 음수가 될 수 없지만(현재가는 양수), 매도 후 잔여 골드는
-  사양에 따라 음수도 그대로 표기됨 (이 엔진의 책임은 아님).
+동작:
+- 매매 (buy/sell): 시트에서 현재가 읽음 → 봇 메모리의 매수/매도 카운터 증가.
+                   시트에 매매 카운터는 쓰지 않음 (매매마다 write API 호출 없음).
+- 3시간 사이클: 봇 메모리의 카운터로 가격 갱신 → 시트에 batch write → 카운터 리셋.
+- 시세 조회 (get_all_snapshots / get_price): 시트에서 즉시 읽음.
+
+산식:
+    base     = uniform(-1, 1)
+    pressure = (buys - sells) / (buys + sells + 1)         # ∈ [-1, +1]
+    delta    = clamp(base + PRESSURE_WEIGHT × pressure, -1, +1)
+    new_price = max(PRICE_FLOOR, round(before × (1 + delta)))
+
+주요 상수:
+- PRICE_FLOOR = 10          (절대 최저가)
+- UPDATE_INTERVAL_SECONDS = 3h
+- INITIAL_PRICE = 20        (시트가 비어있을 때만 씨앗값)
+
+24h 상승률은 봇 메모리의 히스토리로 계산 (재시작 시 리셋).
 """
 
 from __future__ import annotations
 
-import json
-import os
 import random
 import threading
 import time
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from utils.logging_config import logger
+from utils.shared_sheet import (
+    STOCK_NAMES,
+    ensure_stock_sheet_initialized,
+    read_stock_hold_switch,
+    read_stock_prices,
+    write_stock_prices,
+)
 
 
 # ======================================================================
 # 설정 상수
 # ======================================================================
-STOCK_NAMES: Tuple[str, ...] = ('재원', '차성', '적연')
-INITIAL_PRICE = 1000
-PRICE_FLOOR = 1
-UPDATE_INTERVAL_SECONDS = 6 * 60 * 60   # 6시간
-HISTORY_KEEP_CYCLES = 8                  # 48시간 분량 (24h 비교에 4번째 사용)
-DAILY_COMPARE_INDEX = 4                  # 24h = 4 × 6h 사이클
+INITIAL_PRICE = 20                    # 시트 비어있을 때만 씨앗값
+PRICE_FLOOR = 5                       # 절대 최저가
+UPDATE_INTERVAL_SECONDS = 6 * 60 * 60 # 6시간
+HISTORY_KEEP_CYCLES = 8               # 6h × 8 = 48h 분량
+DAILY_COMPARE_INDEX = 4               # 24h = 4 사이클 전
 PRESSURE_WEIGHT = 0.5
 
-DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / 'data' / 'stock_state.json'
-
-
-# ======================================================================
-# 데이터 모델
-# ======================================================================
-
-@dataclass
-class StockState:
-    """단일 종목의 상태."""
-    name: str
-    price: int = INITIAL_PRICE
-    buys: int = 0
-    sells: int = 0
-    # 6시간 사이클마다 push 되는 가격 히스토리 (가장 최근이 마지막).
-    # 길이 ≤ HISTORY_KEEP_CYCLES.
-    history: List[int] = field(default_factory=list)
-
-    def price_24h_ago(self) -> Optional[int]:
-        """24시간 전(4 사이클 전) 가격. 히스토리가 부족하면 None."""
-        if len(self.history) >= DAILY_COMPARE_INDEX:
-            return self.history[-DAILY_COMPARE_INDEX]
-        if self.history:
-            return self.history[0]
-        return None
-
-    def change_rate_24h(self) -> Optional[float]:
-        """24h 대비 상승률 (%). 비교 기준이 0 이면 None."""
-        prev = self.price_24h_ago()
-        if prev is None or prev == 0:
-            return None
-        return (self.price - prev) / prev * 100.0
-
-
-# ======================================================================
-# 엔진 본체
-# ======================================================================
 
 class StockEngine:
-    """프로세스 전역 단일 인스턴스로 사용."""
+    """프로세스 전역 단일 인스턴스."""
 
-    def __init__(self, state_path: Optional[Path] = None):
-        self.state_path = Path(state_path) if state_path else DEFAULT_STATE_FILE
+    def __init__(self):
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_update_ts: float = 0.0
-        self._stocks: Dict[str, StockState] = {
-            name: StockState(name=name) for name in STOCK_NAMES
-        }
-        self._load_state()
+        self._sheets_manager = None
+        self._callback: Optional[Callable] = None
+
+        # 봇 메모리 상태 (재시작 시 리셋)
+        self._buys: Dict[str, int] = {n: 0 for n in STOCK_NAMES}
+        self._sells: Dict[str, int] = {n: 0 for n in STOCK_NAMES}
+        self._history: Dict[str, List[int]] = {n: [] for n in STOCK_NAMES}
 
     # ------------------------------------------------------------------
-    # 영속화
+    # 시트 I/O 래퍼
     # ------------------------------------------------------------------
 
-    def _load_state(self) -> None:
-        if not self.state_path.exists():
-            logger.info(
-                f"[stock] 상태 파일 없음 — 초기값으로 시작 ({self.state_path})"
-            )
-            return
-        try:
-            with open(self.state_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            self._last_update_ts = float(data.get('last_update_ts', 0.0))
-            for name in STOCK_NAMES:
-                raw = data.get('stocks', {}).get(name)
-                if not raw:
-                    continue
-                self._stocks[name] = StockState(
-                    name=name,
-                    price=int(raw.get('price', INITIAL_PRICE)),
-                    buys=int(raw.get('buys', 0)),
-                    sells=int(raw.get('sells', 0)),
-                    history=[int(p) for p in raw.get('history', [])],
-                )
-            logger.info(f"[stock] 상태 로드 완료 ({self.state_path})")
-        except Exception as e:
-            logger.warning(f"[stock] 상태 로드 실패 — 초기값 사용: {e}")
+    def _read_prices(self) -> Dict[str, int]:
+        """시트에서 3종목 가격 읽음. 미설정/None 은 PRICE_FLOOR 로 폴백."""
+        if self._sheets_manager is None:
+            return {n: PRICE_FLOOR for n in STOCK_NAMES}
+        raw = read_stock_prices(self._sheets_manager)
+        return {n: (v if v is not None else PRICE_FLOOR) for n, v in raw.items()}
 
-    def _save_state(self) -> None:
-        try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {
-                'last_update_ts': self._last_update_ts,
-                'stocks': {name: asdict(s) for name, s in self._stocks.items()},
-            }
-            tmp_path = self.state_path.with_suffix('.tmp')
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self.state_path)
-        except Exception as e:
-            logger.warning(f"[stock] 상태 저장 실패: {e}")
+    def _write_prices(self, prices: Dict[str, int]) -> bool:
+        if self._sheets_manager is None:
+            return False
+        return write_stock_prices(self._sheets_manager, prices)
 
     # ------------------------------------------------------------------
     # 조회
     # ------------------------------------------------------------------
 
     def get_price(self, stock_name: str) -> Optional[int]:
-        with self._lock:
-            stock = self._stocks.get(stock_name)
-            return stock.price if stock else None
+        if stock_name not in STOCK_NAMES:
+            return None
+        return self._read_prices().get(stock_name)
 
     def get_all_snapshots(self) -> List[Tuple[str, int, Optional[float]]]:
-        """[(이름, 현재가, 24h 상승률%), ...] 반환."""
+        """[(이름, 현재가, 24h 상승률%), ...]."""
+        prices = self._read_prices()
+        result: List[Tuple[str, int, Optional[float]]] = []
         with self._lock:
-            return [
-                (s.name, s.price, s.change_rate_24h())
-                for s in self._stocks.values()
-            ]
+            for name in STOCK_NAMES:
+                price = prices.get(name, PRICE_FLOOR)
+                change = self._change_rate_24h(name, price)
+                result.append((name, price, change))
+        return result
+
+    def _change_rate_24h(self, name: str, current: int) -> Optional[float]:
+        """봇 메모리 히스토리 기반 24h 상승률. 부족 시 None."""
+        hist = self._history.get(name) or []
+        if len(hist) >= DAILY_COMPARE_INDEX:
+            prev = hist[-DAILY_COMPARE_INDEX]
+        elif hist:
+            prev = hist[0]
+        else:
+            return None
+        if prev == 0:
+            return None
+        return (current - prev) / prev * 100.0
 
     def is_valid_stock(self, stock_name: str) -> bool:
-        return stock_name in self._stocks
+        return stock_name in STOCK_NAMES
 
     def stock_names(self) -> List[str]:
         return list(STOCK_NAMES)
@@ -166,67 +128,84 @@ class StockEngine:
     # ------------------------------------------------------------------
 
     def buy(self, stock_name: str, quantity: int) -> Optional[Tuple[int, int]]:
-        """
-        구매. 카운터를 증가시키고 (단가, 총액) 반환.
-        잘못된 종목/수량이면 None.
-        """
         if quantity <= 0 or not self.is_valid_stock(stock_name):
             return None
+        prices = self._read_prices()
+        price = prices.get(stock_name)
+        if price is None:
+            return None
         with self._lock:
-            stock = self._stocks[stock_name]
-            stock.buys += quantity
-            total = stock.price * quantity
-            self._save_state()
-            return (stock.price, total)
+            self._buys[stock_name] += quantity
+        return (price, price * quantity)
 
     def sell(self, stock_name: str, quantity: int) -> Optional[Tuple[int, int]]:
-        """매도. (단가, 총액) 반환."""
         if quantity <= 0 or not self.is_valid_stock(stock_name):
             return None
+        prices = self._read_prices()
+        price = prices.get(stock_name)
+        if price is None:
+            return None
         with self._lock:
-            stock = self._stocks[stock_name]
-            stock.sells += quantity
-            total = stock.price * quantity
-            self._save_state()
-            return (stock.price, total)
+            self._sells[stock_name] += quantity
+        return (price, price * quantity)
 
     # ------------------------------------------------------------------
-    # 가격 갱신 (6h)
+    # 가격 갱신 (3h 사이클)
     # ------------------------------------------------------------------
 
     def _apply_cycle(self) -> List[Tuple[str, int, int]]:
+        """한 사이클 실행. `[(이름, before, after), ...]`. 락 보유 전제.
+
+        Q5 유지여부 셀 값이 1 이면 사이클 전체를 스킵 (가격 그대로, 카운터도 유지).
+        관리자가 시장을 얼어붙게 하고 싶을 때 사용.
         """
-        1사이클 가격 갱신을 수행하고 [(이름, before, after), ...] 반환.
-        호출자가 락을 잡고 있어야 한다.
-        """
+        # Q5 유지여부 스위치 확인
+        if self._sheets_manager is not None and read_stock_hold_switch(self._sheets_manager):
+            self._last_update_ts = time.time()
+            logger.info("[stock] 유지여부(Q5)=1 — 이번 사이클 스킵 (동결)")
+            # 카운터는 리셋하지 않음: 압력이 다음 사이클로 누적됨.
+            # 히스토리에는 현재가를 다시 push (24h 상승률 계산 시 시간축 유지).
+            prices_now = self._read_prices()
+            for name in STOCK_NAMES:
+                hist = self._history.setdefault(name, [])
+                hist.append(prices_now.get(name, PRICE_FLOOR))
+                if len(hist) > HISTORY_KEEP_CYCLES:
+                    del hist[: len(hist) - HISTORY_KEEP_CYCLES]
+            return []  # 갱신 없음 표시 (post_update_callback 도 빈 리스트 수신)
+
+        prices_before = self._read_prices()
+        prices_after: Dict[str, int] = {}
         results: List[Tuple[str, int, int]] = []
-        for stock in self._stocks.values():
-            before = stock.price
+        for name in STOCK_NAMES:
+            before = prices_before.get(name, PRICE_FLOOR)
+            buys = self._buys[name]
+            sells = self._sells[name]
             base = random.uniform(-1.0, 1.0)
-            total_volume = stock.buys + stock.sells
-            pressure = (stock.buys - stock.sells) / (total_volume + 1)
+            total = buys + sells
+            pressure = (buys - sells) / (total + 1)
             delta = max(-1.0, min(1.0, base + PRESSURE_WEIGHT * pressure))
             new_price = max(PRICE_FLOOR, int(round(before * (1.0 + delta))))
-            stock.price = new_price
+            prices_after[name] = new_price
 
-            # 히스토리에 새 가격 push (사이즈 캡)
-            stock.history.append(new_price)
-            if len(stock.history) > HISTORY_KEEP_CYCLES:
-                stock.history = stock.history[-HISTORY_KEEP_CYCLES:]
+            hist = self._history.setdefault(name, [])
+            hist.append(new_price)
+            if len(hist) > HISTORY_KEEP_CYCLES:
+                del hist[: len(hist) - HISTORY_KEEP_CYCLES]
 
-            # 카운터 리셋
-            stock.buys = 0
-            stock.sells = 0
+            self._buys[name] = 0
+            self._sells[name] = 0
+            results.append((name, before, new_price))
 
-            results.append((stock.name, before, new_price))
+        ok = self._write_prices(prices_after)
+        if not ok:
+            logger.warning("[stock] 시트에 새 가격 저장 실패 (다음 사이클에 재시도)")
         self._last_update_ts = time.time()
         return results
 
     def force_update_cycle(self) -> List[Tuple[str, int, int]]:
-        """디버깅/수동 트리거용. 락 + 저장 포함."""
+        """디버깅/수동 트리거용."""
         with self._lock:
             results = self._apply_cycle()
-            self._save_state()
         for name, before, after in results:
             logger.info(f"[stock] 강제 사이클: {name} {before} → {after}")
         return results
@@ -235,27 +214,29 @@ class StockEngine:
     # 백그라운드 스레드
     # ------------------------------------------------------------------
 
-    def start(self, post_update_callback=None) -> None:
-        """
-        백그라운드 스레드 시작. 이미 실행 중이면 무시.
-
-        Args:
-            post_update_callback: 한 사이클 갱신 직후 호출되는 콜백.
-                시그니처: `fn(results: List[Tuple[name, before, after]])`.
-                시트 미러링용. 예외는 삼킴.
-        """
+    def start(
+        self,
+        sheets_manager,
+        post_update_callback: Optional[Callable] = None,
+    ) -> None:
         if self._thread and self._thread.is_alive():
             return
-        self._stop_event.clear()
+        self._sheets_manager = sheets_manager
         self._callback = post_update_callback
+
+        try:
+            ensure_stock_sheet_initialized(sheets_manager, INITIAL_PRICE)
+        except Exception as e:
+            logger.warning(f"[stock] 시트 초기화 실패 (계속 진행): {e}")
+
+        self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._run_loop,
-            name='stock-engine',
-            daemon=True,
+            target=self._run_loop, name='stock-engine', daemon=True,
         )
         self._thread.start()
         logger.info(
-            f"[stock] 백그라운드 스레드 시작 (주기={UPDATE_INTERVAL_SECONDS}s)"
+            f"[stock] 백그라운드 스레드 시작 (주기={UPDATE_INTERVAL_SECONDS}s, "
+            f"floor={PRICE_FLOOR}G)"
         )
 
     def stop(self) -> None:
@@ -266,23 +247,17 @@ class StockEngine:
         logger.debug("[stock] 백그라운드 스레드 종료")
 
     def _run_loop(self) -> None:
-        """
-        루프 동작:
-        - 부팅 직후 `last_update_ts` 기준으로 다음 사이클까지 남은 시간을 계산.
-        - 0.5초 단위로 stop 이벤트를 폴링하여 빠른 종료 가능.
-        """
+        """3시간마다 사이클 실행. stop 이벤트로 즉시 종료 가능."""
+        with self._lock:
+            if self._last_update_ts <= 0:
+                self._last_update_ts = time.time()
+
         while not self._stop_event.is_set():
             with self._lock:
                 next_fire = self._last_update_ts + UPDATE_INTERVAL_SECONDS
-                if self._last_update_ts <= 0:
-                    # 최초 실행: 한 주기 뒤 첫 갱신.
-                    self._last_update_ts = time.time()
-                    next_fire = self._last_update_ts + UPDATE_INTERVAL_SECONDS
-                    self._save_state()
-
             now = time.time()
             wait_s = max(1.0, next_fire - now)
-            # 짧은 sleep 으로 stop 응답성 확보.
+
             slept = 0.0
             while slept < wait_s and not self._stop_event.is_set():
                 step = min(0.5, wait_s - slept)
@@ -292,17 +267,14 @@ class StockEngine:
             if self._stop_event.is_set():
                 break
 
-            results: List[Tuple[str, int, int]] = []
             with self._lock:
                 results = self._apply_cycle()
-                self._save_state()
             for name, before, after in results:
                 logger.info(f"[stock] 주기 갱신: {name} {before} → {after}")
 
-            callback = getattr(self, '_callback', None)
-            if callback:
+            if self._callback:
                 try:
-                    callback(results)
+                    self._callback(results)
                 except Exception as e:
                     logger.warning(f"[stock] post_update_callback 실패: {e}")
 

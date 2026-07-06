@@ -315,11 +315,12 @@ class BotApplication:
                 if len(errors) > 5:
                     logger.warning(f"  ... 외 {len(errors) - 5}개")
 
-            # 주식 엔진 시작 — 백그라운드에서 6시간마다 가격 갱신.
-            # 상태는 JSON 파일(data/stock_state.json)에 영속화. 시트 미러 없음.
+            # 주식 엔진 시작 — 3시간마다 시트 P/Q열 기반 가격 갱신.
+            # 관리자가 시트 Q열을 직접 수정하면 다음 매매에서 즉시 반영.
             try:
                 self.stock_engine = get_stock_engine()
                 self.stock_engine.start(
+                    sheets_manager=self.sheets_manager,
                     post_update_callback=self._refresh_character_stock_rates,
                 )
                 logger.info("  ✓ 주식 엔진 시작")
