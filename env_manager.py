@@ -56,6 +56,11 @@ GLOBAL_FIELD_SPECS: Dict[str, FieldSpec] = {
         prompt='Google 인증 파일 경로',
         default='credentials.json',
     ),
+    'RESEARCH_SHEET_ID': FieldSpec(
+        key='RESEARCH_SHEET_ID',
+        prompt='개인조사시트 ID (정찰용, 선택, 비우면 [정찰] 명령 비활성화)',
+        default='',
+    ),
     'OPERATION_START_DATE': FieldSpec(
         key='OPERATION_START_DATE',
         prompt='가동 시작 날짜 KST YYYY-MM-DD (선택, 비우면 무제한)',
@@ -96,6 +101,11 @@ GLOBAL_SECTIONS: Tuple[SectionSpec, ...] = (
             'SYSTEM_ADMIN_ID',
             'GOOGLE_CREDENTIALS_PATH',
         ),
+    ),
+    SectionSpec(
+        title='개인조사시트 (선택)',
+        description='[정찰] 명령어용 별개 스프레드시트. 비우면 정찰 비활성화.',
+        keys=('RESEARCH_SHEET_ID',),
     ),
     SectionSpec(
         title='가동 기간 (선택)',
