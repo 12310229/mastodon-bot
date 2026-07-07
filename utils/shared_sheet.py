@@ -286,6 +286,14 @@ def add_to_inventory(
         ok = sheets_manager.update_cell(
             WS_BOT_INFO, existing.row, BOT_INFO_COL_ITEM_QTY, str(new_qty),
         )
+        if ok:
+            logger.info(
+                f"[창고 추가] '{name}' row={existing.row} {existing.qty}→{new_qty}"
+            )
+        else:
+            logger.error(
+                f"[창고 추가] '{name}' row={existing.row} update_cell 실패"
+            )
         return ok
 
     # 신규: 빈 행을 찾거나 append.
@@ -313,22 +321,45 @@ def add_to_inventory(
     ok_qty = sheets_manager.update_cell(
         WS_BOT_INFO, insert_row, BOT_INFO_COL_ITEM_QTY, str(max(0, qty)),
     )
-    return ok_name and ok_qty
+    ok = ok_name and ok_qty
+    if ok:
+        logger.info(f"[창고 추가] '{name}' 신규 row={insert_row} qty={qty}")
+    else:
+        logger.error(
+            f"[창고 추가] '{name}' 신규 row={insert_row} 실패 "
+            f"(name={ok_name}, qty={ok_qty})"
+        )
+    return ok
 
 
 def consume_from_inventory(
     sheets_manager: SheetsManager, name: str, qty: int,
 ) -> bool:
-    """공동 창고 차감. 잔량 미달 시 False."""
+    """공동 창고 차감. 잔량 미달 시 False. 각 단계 결과를 로그로 남긴다."""
     if qty <= 0:
         return True
     existing = find_inventory_item(sheets_manager, name)
-    if not existing or existing.qty < qty:
+    if not existing:
+        logger.warning(f"[창고 차감] '{name}' 을(를) 찾지 못함")
+        return False
+    if existing.qty < qty:
+        logger.warning(
+            f"[창고 차감] '{name}' 부족 (보유 {existing.qty} / 요청 {qty})"
+        )
         return False
     new_qty = existing.qty - qty
-    return sheets_manager.update_cell(
+    ok = sheets_manager.update_cell(
         WS_BOT_INFO, existing.row, BOT_INFO_COL_ITEM_QTY, str(new_qty),
     )
+    if ok:
+        logger.info(
+            f"[창고 차감] '{name}' row={existing.row} {existing.qty}→{new_qty}"
+        )
+    else:
+        logger.error(
+            f"[창고 차감] '{name}' row={existing.row} update_cell 실패"
+        )
+    return ok
 
 
 # ======================================================================

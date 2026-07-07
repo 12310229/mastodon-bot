@@ -83,6 +83,9 @@ class SheetsManager:
         self._custom_command_cache: Optional[Dict[str, List[str]]] = None
         self._custom_command_cache_expires: float = 0.0
         self._aux_lock = threading.RLock()
+
+        # 개인조사시트 (별개 스프레드시트, [정찰] 용) — lazy
+        self._research_spreadsheet: Optional[gspread.Spreadsheet] = None
         
     @property
     def spreadsheet(self):
@@ -780,6 +783,47 @@ class SheetsManager:
         """
         cache = self._get_custom_command_cache()
         return len(cache)
+
+    # ==================== 개인조사시트 (별개 스프레드시트) ====================
+
+    def _open_research_spreadsheet(self) -> Optional[gspread.Spreadsheet]:
+        """개인조사시트 1회 연결. 인증 파일은 메인 시트와 공유."""
+        sheet_id = getattr(config, 'RESEARCH_SHEET_ID', '')
+        if not sheet_id:
+            return None
+        try:
+            gc = gspread.service_account(filename=str(self.credentials_path))
+            spreadsheet = gc.open_by_key(sheet_id)
+            logger.debug(f"개인조사시트 연결: {sheet_id}")
+            return spreadsheet
+        except FileNotFoundError:
+            logger.error(f"개인조사시트 인증 파일 없음: {self.credentials_path}")
+        except gspread.exceptions.SpreadsheetNotFound:
+            logger.error(f"개인조사시트를 찾을 수 없음 (ID={sheet_id})")
+        except Exception as e:
+            logger.error(f"개인조사시트 연결 실패 (ID={sheet_id}): {e}")
+        return None
+
+    def _get_research_spreadsheet(self) -> Optional[gspread.Spreadsheet]:
+        """개인조사시트 핸들 (lazy)."""
+        with self._aux_lock:
+            if self._research_spreadsheet is None:
+                self._research_spreadsheet = self._open_research_spreadsheet()
+            return self._research_spreadsheet
+
+    def get_research_worksheet(self, worksheet_name: str) -> Optional[gspread.Worksheet]:
+        """개인조사시트의 특정 워크시트 반환. 없으면 None."""
+        spreadsheet = self._get_research_spreadsheet()
+        if spreadsheet is None:
+            return None
+        try:
+            return spreadsheet.worksheet(worksheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            logger.warning(f"개인조사시트 워크시트를 찾을 수 없음: {worksheet_name}")
+            return None
+        except Exception as e:
+            logger.warning(f"개인조사시트 워크시트 접근 실패 ({worksheet_name}): {e}")
+            return None
 
     # ==================== 기존 메서드들 ====================
 

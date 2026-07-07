@@ -93,6 +93,13 @@ class Config:
     CUSTOM_COMMAND_WORKSHEET: str = os.getenv('CUSTOM_COMMAND_WORKSHEET', '커스텀').strip() or '커스텀'
 
     # ------------------------------------------------------------------
+    # 개인조사시트 (별개 스프레드시트 — [정찰] 명령어용)
+    # 빈 값이면 [정찰] 명령어는 사용 불가.
+    # ------------------------------------------------------------------
+    RESEARCH_SHEET_ID: str = os.getenv('RESEARCH_SHEET_ID', '').strip()
+    RESEARCH_WORKSHEET: str = os.getenv('RESEARCH_WORKSHEET', '정찰').strip() or '정찰'
+
+    # ------------------------------------------------------------------
     # 가동 기간 (KST, YYYY-MM-DD; 빈 값은 무제한)
     # ------------------------------------------------------------------
     OPERATION_START_DATE: str = os.getenv('OPERATION_START_DATE', '').strip()
