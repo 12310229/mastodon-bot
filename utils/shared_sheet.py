@@ -67,12 +67,15 @@ RAID_COL_MP_MAX = 14      # N 최대 MP
 # P/Q: 주식 (종목명/현재가). 관리자가 Q 열을 직접 수정하면 주가 조작 가능.
 # R : 다음 사이클 예상 주가. 정각 30분 전 봇이 계산해 기록.
 #     정각에 봇이 R 값을 그대로 Q 에 복사 → 관리자가 30분 안에 R 을 수정하면 반영됨.
+# S : 오늘의 변동형 (하락형/상승형/계단형/봉우리형). 매일 06:00 변동에서 재추첨.
+#     관리자가 수정하면 다음 변동부터 그 패턴을 따름.
 BOT_INFO_DATA_START_ROW = 2
 BOT_INFO_COL_ITEM_NAME = 13  # M
 BOT_INFO_COL_ITEM_QTY = 14   # N
 BOT_INFO_COL_STOCK_NAME = 16    # P
 BOT_INFO_COL_STOCK_PRICE = 17   # Q
 BOT_INFO_COL_STOCK_PREVIEW = 18 # R
+BOT_INFO_COL_STOCK_PATTERN = 19 # S
 
 # 주식 종목별 고정 행 (2/3/4). 종목명은 P열 헤더 아래에 이 순서대로 기록.
 STOCK_NAMES: Tuple[str, ...] = ('재원', '차성', '적연')
@@ -638,6 +641,44 @@ def clear_stock_previews(sheets_manager: SheetsManager) -> bool:
     return sheets_manager.batch_update_cells(WS_BOT_INFO, updates)
 
 
+def read_stock_patterns(sheets_manager: SheetsManager) -> Dict[str, Optional[str]]:
+    """S2:S4 (오늘의 변동형) 을 batch 로 읽어 `{종목: 변동형}` 반환. 빈 셀은 None."""
+    result: Dict[str, Optional[str]] = {name: None for name in STOCK_NAMES}
+    try:
+        ws = sheets_manager.get_worksheet(WS_BOT_INFO)
+    except Exception as e:
+        logger.warning(f"[shared_sheet] 변동형 워크시트 조회 실패: {e}")
+        return result
+
+    cells = [(STOCK_ROW_BY_NAME[n], BOT_INFO_COL_STOCK_PATTERN) for n in STOCK_NAMES]
+    values = sheets_manager.batch_get_cells_safe(ws, cells)
+    if values is None:
+        values = [
+            sheets_manager.get_cell_value_safe(ws, row, col)
+            for row, col in cells
+        ]
+
+    for name, raw in zip(STOCK_NAMES, values):
+        text = str(raw or '').strip()
+        result[name] = text if text else None
+    return result
+
+
+def write_stock_patterns(
+    sheets_manager: SheetsManager, patterns: Dict[str, str],
+) -> bool:
+    """`{종목: 변동형}` 을 S2/S3/S4 에 batch write."""
+    updates = []
+    for name, pattern in patterns.items():
+        row = STOCK_ROW_BY_NAME.get(name)
+        if row is None:
+            continue
+        updates.append((row, BOT_INFO_COL_STOCK_PATTERN, str(pattern)))
+    if not updates:
+        return True
+    return sheets_manager.batch_update_cells(WS_BOT_INFO, updates)
+
+
 def ensure_stock_sheet_initialized(
     sheets_manager: SheetsManager, initial_price: int,
 ) -> None:
@@ -651,11 +692,12 @@ def ensure_stock_sheet_initialized(
         logger.warning(f"[shared_sheet] 주가 시트 초기화 스킵: {e}")
         return
 
-    # 헤더 (P1/Q1/R1)
+    # 헤더 (P1/Q1/R1/S1)
     header_cells = [
         (1, BOT_INFO_COL_STOCK_NAME),
         (1, BOT_INFO_COL_STOCK_PRICE),
         (1, BOT_INFO_COL_STOCK_PREVIEW),
+        (1, BOT_INFO_COL_STOCK_PATTERN),
     ]
     header_values = sheets_manager.batch_get_cells_safe(ws, header_cells)
     if header_values is None:
@@ -670,6 +712,8 @@ def ensure_stock_sheet_initialized(
         updates.append((1, BOT_INFO_COL_STOCK_PRICE, '현재가'))
     if len(header_values) < 3 or not str(header_values[2] or '').strip():
         updates.append((1, BOT_INFO_COL_STOCK_PREVIEW, '다음 예상가'))
+    if len(header_values) < 4 or not str(header_values[3] or '').strip():
+        updates.append((1, BOT_INFO_COL_STOCK_PATTERN, '변동형'))
 
     # 종목명 (P2/P3/P4)
     name_cells = [(STOCK_ROW_BY_NAME[n], BOT_INFO_COL_STOCK_NAME) for n in STOCK_NAMES]
