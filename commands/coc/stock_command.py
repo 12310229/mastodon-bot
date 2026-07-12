@@ -133,6 +133,17 @@ class StockCommand(BaseCommand):
             )
 
             if side == 'buy':
+                # 잔액 사전 검증 — 부족하면 매수 카운터도 올리지 않고 실패.
+                price_now = engine.get_price(stock_name)
+                if price_now is None:
+                    raise CommandError("주식 시세를 조회할 수 없습니다.")
+                total_needed = price_now * quantity
+                if current_gold < total_needed:
+                    raise CommandError(
+                        f"보유 골드가 부족합니다. "
+                        f"(보유 {current_gold}G / 필요 {total_needed}G)"
+                    )
+
                 tx = engine.buy(stock_name, quantity)
                 if tx is None:
                     raise CommandError("주식 구매에 실패했습니다.")
