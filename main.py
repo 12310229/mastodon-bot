@@ -5,6 +5,7 @@ CoC 마스토돈 자동봇 — 메인 실행 파일.
 import os
 import sys
 import signal
+import threading
 import time
 from typing import Optional
 
@@ -450,15 +451,50 @@ class BotApplication:
             logger.debug(LogFormatter.operation_fail("[종료] 정리 작업", e), exc_info=True)
 
     # ------------------------------------------------------------------
-    # 주식 가격 변동 콜백 — 시트 동기화 대상 없음.
-    # 시트에는 주 수/투자금만 저장하고, 수익금·이익률은 [상태창]/거래 응답에서
-    # 즉시 계산하므로 6h마다 일괄 갱신할 셀이 없다. 로그만 남긴다.
+    # 주식 가격 변동 콜백 (정각 커밋 직후 호출)
+    # 시트에는 이미 새 가격이 반영된 상태 → 1분 뒤 주가 툿을 업로드한다.
     # ------------------------------------------------------------------
+    _STOCK_TOOT_DELAY_SECONDS = 60
+
     def _refresh_character_stock_rates(self, results) -> None:
         if not results:
             return
         summary = ', '.join(f"{name} {before}→{after}" for name, before, after in results)
         logger.info(f"[stock] 6h 사이클 적용: {summary}")
+
+        if self.api is None:
+            logger.debug("[stock] API 미연결 — 주가 툿 생략")
+            return
+
+        # 시트 선반영(커밋) 완료 → 1분 뒤 툿 업로드.
+        # Timer 스레드로 분리해 stock-engine 루프를 블로킹하지 않는다.
+        timer = threading.Timer(
+            self._STOCK_TOOT_DELAY_SECONDS, self._post_stock_toot, args=(results,),
+        )
+        timer.daemon = True
+        timer.start()
+        logger.debug(
+            f"[stock] 주가 툿 예약 ({self._STOCK_TOOT_DELAY_SECONDS}초 후)"
+        )
+
+    def _post_stock_toot(self, results) -> None:
+        """주가 변동 안내 툿 업로드 (public)."""
+        try:
+            lines = ["주가 변동 안내"]
+            for name, before, after in results:
+                if before > 0:
+                    rate = (after - before) / before * 100.0
+                    sign = '+' if rate >= 0 else ''
+                    rate_str = f" ({sign}{rate:.1f}%)"
+                else:
+                    rate_str = ''
+                lines.append(f"{name}: {before}G → {after}G{rate_str}")
+
+            status_text = config.format_response('\n'.join(lines))
+            self.api.status_post(status=status_text, visibility='public')
+            logger.info("[stock] 주가 툿 업로드 ✓")
+        except Exception as e:
+            logger.warning(f"[stock] 주가 툿 업로드 실패: {e}")
 
 
     def get_status(self) -> dict:

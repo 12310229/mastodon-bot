@@ -75,9 +75,9 @@ class StockCommand(BaseCommand):
         lines = ["━━━ 주식 시세 ━━━"]
         for name, price, change in snapshots:
             if change is None:
-                rate_str = "(전일 데이터 없음)"
+                rate_str = "(직전 데이터 없음)"
             else:
-                rate_str = _format_rate(change) + " (24h)"
+                rate_str = _format_rate(change) + " (직전 대비)"
             lines.append(f"{name}: {price} 골드  {rate_str}")
         return CommandResponse.create_success('\n'.join(lines))
 
