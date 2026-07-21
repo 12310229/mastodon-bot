@@ -177,7 +177,7 @@ class JudgmentCommand(BaseCommand):
 
         message = (
             f"━━━ {title}님의 이능력 판정 ━━━\n"
-            f"d100 = {roll} → 보정 R = {adjusted} (이능력 등급 {grade_letter})\n"
+            f"d100 = {adjusted} (이능력 등급 {grade_letter})\n"
             f"대성공 ≤ {critical_success_threshold} / "
             f"성공 ≤ 50 / "
             f"대실패 > {critical_failure_over:.1f}\n"
