@@ -61,6 +61,7 @@ RAID_COL_HP_CUR = 11      # K 현재 HP
 RAID_COL_HP_MAX = 12      # L 최대 HP
 RAID_COL_MP_CUR = 13      # M 현재 MP
 RAID_COL_MP_MAX = 14      # N 최대 MP
+RAID_COL_ABILITY = 15     # O 이능력 등급 (0=F, 1=D, 2=C, 3=B, 4=A, 5=S)
 
 # '자동봇용 정보' — 1행 header, 2행~ 데이터
 # M/N: 공동 창고 (아이템 이름/수량)
