@@ -10,12 +10,16 @@
 
 from __future__ import annotations
 
+import os
+import random
 import re
-from typing import List, Tuple
+import time
+from typing import List, Optional, Tuple
 
 from commands.base_command import BaseCommand, CommandContext, CommandResponse
 from commands.registry import register_command
 from commands.trpg_common.fallback_helpers import acquire_user_lock
+from config.settings import config
 from utils.decorators import handle_command_errors
 from utils.error_handling import CommandError
 from utils.logging_config import logger
@@ -30,6 +34,7 @@ from utils.shared_sheet import (
     RAID_DATA_START_ROW,
     WS_EQUIP_STOCK,
     WS_RAID,
+    WS_SHOP,
     _normalize_item_name,
     add_to_inventory,
     consume_from_inventory,
@@ -43,6 +48,19 @@ from utils.shared_sheet import (
 
 # `소형HP포션(2)` 또는 `대형MP포션` 패턴.
 _ITEM_PATTERN = re.compile(r'^(?P<name>.+?)(?:\((?P<qty>\d+)\))?$')
+
+
+# ======================================================================
+# 가챠 설정
+# ======================================================================
+GACHA_POUCH_NAME = '가챠파우치'         # 상점 A열에 등록된 구매 대상 이름
+GACHA_LIST_COL = 2                      # 상점 B열
+GACHA_LIST_ROW_START = 50               # B50
+GACHA_LIST_ROW_END = 78                 # B78 (총 29개)
+GACHA_IMAGE_DIR = config.BASE_DIR / 'gacha_images'
+GACHA_IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
+MASTODON_MAX_MEDIA = 4                  # 툿당 이미지 최대 개수
+GACHA_MAX_DRAW = 40                     # 한 번에 뽑을 수 있는 최대 수 (스팸 방지)
 
 
 def _parse_item_list(raw: str) -> List[Tuple[str, int]]:
@@ -74,9 +92,10 @@ def _parse_item_list(raw: str) -> List[Tuple[str, int]]:
     examples=[
         "[아이템 사용/소형HP포션(1), 대형MP포션(3)]",
         "[아이템 구매/소형HP포션(2)]",
+        "[아이템 구매/가챠파우치(3)]",
     ],
     requires_sheets=True,
-    requires_api=False,
+    requires_api=True,   # 가챠 이미지 첨부 툿을 직접 전송하므로 API 필요
     priority=10,
 )
 class ItemCommand(BaseCommand):
@@ -196,6 +215,11 @@ class ItemCommand(BaseCommand):
         raw = ', '.join(context.keywords[1:])
         items = _parse_item_list(raw)
 
+        # 가챠파우치 단독 구매 감지 → 특수 처리 (뽑기 + 이미지 전송)
+        if (len(items) == 1
+                and _normalize_item_name(items[0][0]) == _normalize_item_name(GACHA_POUCH_NAME)):
+            return self._handle_gacha(context, title, equip_row, items[0][1])
+
         # 사전 검증
         resolved = []  # [(ShopItem, qty, line_total)]
         total_cost = 0
@@ -249,3 +273,158 @@ class ItemCommand(BaseCommand):
             f"{current_gold}→{new_gold}"
         )
         return CommandResponse.create_success(body)
+
+    # ------------------------------------------------------------------
+    # 가챠파우치
+    # ------------------------------------------------------------------
+    def _handle_gacha(
+        self, context: CommandContext, title: str, equip_row: int, qty: int,
+    ) -> CommandResponse:
+        """가챠파우치 n개 구매 → 랜덤 n개 뽑아 이미지+텍스트로 스레드 전송.
+
+        - 상점 A열의 '가챠파우치' 가격/재고로 골드 차감 + 재고 감소.
+        - 상점 B50:B78 에서 중복 허용 랜덤 n개.
+        - 결과는 창고에 반영하지 않고 출력만 한다.
+        - 이미지+스레드는 self.api 로 직접 전송하고, 빈 응답을 반환해
+          stream_handler 의 추가 전송을 막는다.
+        """
+        if qty <= 0:
+            raise CommandError("뽑을 수량은 1 이상이어야 합니다.")
+        if qty > GACHA_MAX_DRAW:
+            raise CommandError(f"한 번에 최대 {GACHA_MAX_DRAW}개까지 뽑을 수 있습니다.")
+
+        # 상점에서 가챠파우치 가격/재고 확인
+        pouch = find_shop_item(self.sheets_manager, GACHA_POUCH_NAME)
+        if pouch is None:
+            raise CommandError(
+                f"'상점'에 '{GACHA_POUCH_NAME}' 이(가) 없습니다. A열에 등록해 주세요."
+            )
+        if pouch.stock < qty:
+            raise CommandError(
+                f"'{GACHA_POUCH_NAME}' 재고 부족 (재고 {pouch.stock} / 요청 {qty})"
+            )
+        total_cost = pouch.price * qty
+
+        # 가챠 후보 리스트 (B50:B78)
+        candidates = self._read_gacha_candidates()
+        if not candidates:
+            raise CommandError("가챠 아이템 목록(상점 B50:B78)이 비어 있습니다.")
+
+        with acquire_user_lock(context.user_id, timeout=10.0):
+            current_gold = read_int_cell(
+                self.sheets_manager, WS_EQUIP_STOCK, equip_row, EQUIP_COL_GOLD,
+            )
+            if current_gold < total_cost:
+                raise CommandError(
+                    f"골드 부족 (보유 {current_gold} / 필요 {total_cost})"
+                )
+            new_gold = current_gold - total_cost
+            gold_ok = self.sheets_manager.update_cell(
+                WS_EQUIP_STOCK, equip_row, EQUIP_COL_GOLD, str(new_gold),
+            )
+            if not gold_ok:
+                raise CommandError("골드 차감에 실패했습니다.")
+            update_shop_stock(self.sheets_manager, pouch.row, pouch.stock - qty)
+
+        # 뽑기 (중복 허용)
+        drawn = [random.choice(candidates) for _ in range(qty)]
+        logger.info(
+            f"[가챠] @{context.user_id} ({title}) x{qty} cost={total_cost} "
+            f"gold {current_gold}→{new_gold} 결과={drawn}"
+        )
+
+        # 이미지+텍스트 스레드 전송 (api 직접)
+        header = (
+            f"🎁 {title}님의 가챠파우치 개봉! ({qty}개)\n"
+            f"골드 {current_gold} → {new_gold} (-{total_cost})"
+        )
+        self._send_gacha_result(context, drawn, header)
+
+        # stream_handler 가 추가 전송하지 않도록 빈 응답.
+        return CommandResponse.create_success('')
+
+    def _read_gacha_candidates(self) -> List[str]:
+        """상점 B50:B78 의 비어있지 않은 아이템명 리스트."""
+        try:
+            ws = self.sheets_manager.get_worksheet(WS_SHOP)
+            col_b = ws.col_values(GACHA_LIST_COL)
+        except Exception as e:
+            logger.warning(f"[가챠] 후보 목록 조회 실패: {e}")
+            return []
+        result: List[str] = []
+        for idx, value in enumerate(col_b, start=1):
+            if idx < GACHA_LIST_ROW_START or idx > GACHA_LIST_ROW_END:
+                continue
+            name = (value or '').strip()
+            if name:
+                result.append(name)
+        return result
+
+    def _resolve_image_path(self, item_name: str) -> Optional[str]:
+        """gacha_images/{아이템명}.{ext} 를 탐색. 없으면 None."""
+        for ext in GACHA_IMAGE_EXTS:
+            path = GACHA_IMAGE_DIR / f"{item_name}{ext}"
+            if path.exists():
+                return str(path)
+        return None
+
+    def _resolve_reply_visibility(self, original: str) -> str:
+        """원본 visibility → 응답 visibility (stream_handler 규칙과 동일)."""
+        if original == 'direct':
+            return 'direct'
+        if original == 'unlisted':
+            return 'unlisted'
+        return 'private'
+
+    def _send_gacha_result(
+        self, context: CommandContext, drawn: List[str], header: str,
+    ) -> None:
+        """뽑은 아이템을 이미지+텍스트로 스레드 전송 (이미지 4개/툿)."""
+        metadata = context.metadata or {}
+        reply_to = metadata.get('status_id')
+        visibility = self._resolve_reply_visibility(metadata.get('visibility', 'public'))
+        sender = context.user_id
+        mention = f"@{sender} " if sender else ""
+
+        # 4개씩 청크로 분할
+        chunks = [
+            drawn[i:i + MASTODON_MAX_MEDIA]
+            for i in range(0, len(drawn), MASTODON_MAX_MEDIA)
+        ]
+
+        for chunk_idx, chunk in enumerate(chunks):
+            base_index = chunk_idx * MASTODON_MAX_MEDIA
+            media_ids: List[str] = []
+            text_lines: List[str] = []
+            for offset, name in enumerate(chunk):
+                num = base_index + offset + 1
+                path = self._resolve_image_path(name)
+                if path:
+                    try:
+                        media = self.api.media_post(path, description=name)
+                        media_ids.append(media['id'])
+                        text_lines.append(f"{num}. {name}")
+                    except Exception as e:
+                        logger.warning(f"[가챠] 이미지 업로드 실패 ({name}): {e}")
+                        text_lines.append(f"{num}. {name} (이미지 없음)")
+                else:
+                    text_lines.append(f"{num}. {name} (이미지 없음)")
+
+            # 첫 청크에만 헤더
+            body = (header + "\n\n" if chunk_idx == 0 else "") + "\n".join(text_lines)
+            status_text = config.format_response(f"{mention}{body}")
+
+            try:
+                sent = self.api.status_post(
+                    status=status_text,
+                    in_reply_to_id=reply_to,
+                    visibility=visibility,
+                    media_ids=media_ids or None,
+                )
+                reply_to = sent['id']
+            except Exception as e:
+                logger.error(f"[가챠] 툿 전송 실패 (청크 {chunk_idx + 1}): {e}", exc_info=True)
+                break
+
+            if chunk_idx < len(chunks) - 1:
+                time.sleep(0.5)

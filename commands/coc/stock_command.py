@@ -13,6 +13,7 @@ from __future__ import annotations
 from commands.base_command import BaseCommand, CommandContext, CommandResponse
 from commands.registry import register_command
 from commands.trpg_common.fallback_helpers import acquire_user_lock
+from config.settings import config
 from utils.decorators import handle_command_errors
 from utils.error_handling import CommandError
 from utils.logging_config import logger
@@ -51,6 +52,10 @@ class StockCommand(BaseCommand):
     def execute(self, context: CommandContext) -> CommandResponse:
         if not context.keywords:
             raise CommandError("주식 명령어가 비어 있습니다.")
+
+        # 주식 기능 전체 비활성화 스위치 (STOCK_DISABLED=1)
+        if getattr(config, 'STOCK_DISABLED', False):
+            raise CommandError("주식 기능은 현재 종료되어 이용할 수 없습니다.")
 
         head = context.keywords[0].replace(' ', '')
 
