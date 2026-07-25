@@ -316,18 +316,21 @@ class BotApplication:
                 if len(errors) > 5:
                     logger.warning(f"  ... 외 {len(errors) - 5}개")
 
-            # 주식 엔진 시작 — 3시간마다 시트 P/Q열 기반 가격 갱신.
-            # 관리자가 시트 Q열을 직접 수정하면 다음 매매에서 즉시 반영.
-            try:
-                self.stock_engine = get_stock_engine()
-                self.stock_engine.start(
-                    sheets_manager=self.sheets_manager,
-                    post_update_callback=self._refresh_character_stock_rates,
-                )
-                logger.info("  ✓ 주식 엔진 시작")
-            except Exception as e:
-                logger.warning("주식 엔진 시작 실패 — 거래는 가능하나 자동 갱신은 비활성")
-                logger.debug(LogFormatter.operation_fail("주식 엔진 시작", e))
+            # 주식 엔진 시작 — 6시간마다 시트 기반 가격 갱신 + 자동 툿.
+            # STOCK_DISABLED=1 이면 자동 변동/자동 툿을 아예 시작하지 않는다.
+            if getattr(config, 'STOCK_DISABLED', False):
+                logger.info("  · 주식 기능 비활성화 (STOCK_DISABLED=1) — 엔진 미시작")
+            else:
+                try:
+                    self.stock_engine = get_stock_engine()
+                    self.stock_engine.start(
+                        sheets_manager=self.sheets_manager,
+                        post_update_callback=self._refresh_character_stock_rates,
+                    )
+                    logger.info("  ✓ 주식 엔진 시작")
+                except Exception as e:
+                    logger.warning("주식 엔진 시작 실패 — 거래는 가능하나 자동 갱신은 비활성")
+                    logger.debug(LogFormatter.operation_fail("주식 엔진 시작", e))
 
             logger.debug(LogFormatter.boot_ok(step, total, name))
             return True
